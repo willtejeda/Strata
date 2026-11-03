@@ -31,6 +31,7 @@
 #include <map>
 #include <mutex>
 #include <utility>
+#include "../ds4_pascal.cuh"  // Pascal: __dp4a fallback (sm_60)
 
 namespace strata::dsv41k::exl3::legacy {
 namespace {

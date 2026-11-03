@@ -25,6 +25,7 @@
 #include <cstring>
 #include <mutex>
 #include <unordered_map>
+#include "ds4_pascal.cuh"  // Pascal: __dp4a fallback (sm_60)
 
 namespace strata::ds4::gguf {
 namespace {

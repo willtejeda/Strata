@@ -13,6 +13,7 @@
 #include <cuda_fp16.h>
 #if !defined(STRATA_USE_HIP)
 #include <mma.h>
+#include "ds4_pascal.cuh"  // Pascal: __dp4a fallback, WMMA stand-ins (sm_60)
 #endif
 
 #define GGML_COMMON_DECL_CUDA

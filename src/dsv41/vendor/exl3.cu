@@ -36,6 +36,7 @@
 #include <map>
 #include <mutex>
 #include <utility>
+#include "../ds4_pascal.cuh"  // Pascal: __dp4a fallback (sm_60)
 
 #if !defined(STRATA_USE_HIP)
 namespace strata::dsv41k::exl3::legacy {   // exl3_legacy.cu: v1.1.8's decode kernels
