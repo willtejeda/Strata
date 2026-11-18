@@ -874,7 +874,7 @@ std::size_t p100_mmvq_f16_scratch_bytes(int max_in, int max_cols) {
 }
 
 bool p100_mmvq_f16_prep(const float* x, int n_in, int ncols, void* scratch, std::size_t cap, void* stream) {
-    if (!scratch || ncols < 2 || ncols > 12 || n_in % 512 != 0) return false;
+    if (!scratch || ncols < 1 || ncols > 12 || n_in % 512 != 0) return false;   // (1 column: the Q6_K heads, below)
     if (reinterpret_cast<std::uintptr_t>(x) % 16 != 0 || reinterpret_cast<std::uintptr_t>(scratch) % 16 != 0) return false;
     const int nw = (n_in + MMVQ_F16_WIN - 1) / MMVQ_F16_WIN;
     if (p100_mmvq_f16_scratch_bytes(n_in, ncols) > cap) return false;
@@ -888,7 +888,10 @@ bool p100_mmvq_f16_prep(const float* x, int n_in, int ncols, void* scratch, std:
 bool p100_mmvq_f16(int ggml_type, const void* weights, float* y, int n_in, int n_out, int ncols, const void* scratch,
                    void* stream) {
     if (ggml_type != 13 && ggml_type != 14) return false;          // Q5_K, Q6_K
-    if (!scratch || ncols < 2 || ncols > 12 || n_out < 16 || n_in % 512 != 0) return false;
+    if (!scratch || ncols < 1 || ncols > 12 || n_out < 16 || n_in % 512 != 0) return false;
+    // one column: only the big Q6_K heads (the MTP draft head, 106k rows: 1.11 -> ~0.45 ms on a P100); the small Q5_K / Q6_K
+    // projections stay on the q8_1 kernels at one column, where those were measured as fast or faster
+    if (ncols == 1 && (ggml_type != 14 || n_out < 32768)) return false;
     if (reinterpret_cast<std::uintptr_t>(weights) % 4 != 0) return false;
     int dev = 0;
     cudaGetDevice(&dev);

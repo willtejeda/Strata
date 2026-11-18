@@ -370,6 +370,8 @@ private:
     float* sh_scratch_ = nullptr;
     uint16_t* x_bf16_ = nullptr;
     float* head_logits_ = nullptr;
+    void* head_f16_scr_ = nullptr;      // p100k: the FP16 draft-head input (p100_mmvq_f16_prep)
+    size_t head_f16_cap_ = 0;
     float* dummy_inj_ = nullptr;
     int64_t cap_ = 0, attn_scratch_floats_ = 0;
 };

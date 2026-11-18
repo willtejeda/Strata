@@ -14,6 +14,7 @@
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/fused_gr.hpp"
+#include "strata/kernels/p100_mmvq_f16.hpp"
 #include "strata/kernels/gr.hpp"
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/kernels/kv_q8.hpp"
@@ -197,6 +198,7 @@ MtpDrafter::~MtpDrafter() {
     if (state_arena_) cudaFree(state_arena_);
     if (arena_) cudaFree(arena_);
     if (head_logits_) cudaFree(head_logits_);
+    if (head_f16_scr_) cudaFree(head_f16_scr_);
     if (owns_draft_head_ && dhead_) {
         strata::kernels::native_q6_k_unpack(dhead_);
         strata::kernels::native_q8_0_sm60_release(dhead_);
@@ -803,6 +805,12 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
         err = "mtp: the draft logits do not fit";
         return false;
     }
+    // p100k: the draft head on the FP16 mat-vec (Q6_K, any window width); scratch made here, never in a capture
+    static const bool head_f16_env = [] { const char* v = std::getenv("STRATA_MTP_HEAD_F16"); return !(v && v[0] == '0'); }();
+    if (head_f16_scr_ == nullptr && head_f16_env && strata::kernels::p100_mmvq_f16_on()) {
+        head_f16_cap_ = strata::kernels::p100_mmvq_f16_scratch_bytes((int) wo->ne0, (int) max_t_);
+        if (cudaMalloc(&head_f16_scr_, head_f16_cap_) != cudaSuccess) { (void) cudaGetLastError(); head_f16_scr_ = nullptr; head_f16_cap_ = 0; }
+    }
     if (shared != nullptr) {
         if (shared->head_ != head || shared->device_ != device_ ||
             shared->n_vocab_ != n_vocab_) {
@@ -1375,8 +1383,15 @@ bool MtpDrafter::record_rest(int step_row, cudaStream_t cs, std::string& err) {
         if (!q8_head) native_quantize_q8_1(sample_, xq_, (int) N, T, cs);
         const bool sub = dhead_ != nullptr;
         const int64_t nv = sub ? n_dvocab_ : n_vocab_;
-        native_mmvq(sub ? dhead_type_ : head_->type(), sub ? dhead_ : head_->weights(), xq_, head_logits_, (int) N,
-                    (int) nv, T, cs);
+        {
+            const int ht = sub ? dhead_type_ : head_->type();
+            const void* hw = sub ? dhead_ : head_->weights();
+            // p100k: the FP16 mat-vec reads sample_ (the head's float input, always written above); else the q8_1 kernel
+            const bool f16 = head_f16_scr_ != nullptr && ht == 14 && !strata::kernels::native_q6_k_packed_enabled() &&
+                             strata::kernels::p100_mmvq_f16_prep(sample_, (int) N, T, head_f16_scr_, head_f16_cap_, cs) &&
+                             strata::kernels::p100_mmvq_f16(ht, hw, head_logits_, (int) N, (int) nv, T, head_f16_scr_, cs);
+            if (!f16) native_mmvq(ht, hw, xq_, head_logits_, (int) N, (int) nv, T, cs);
+        }
         g_mp.stamp(14, cs);
         if (coupled_rec_) {
             // coupled draft sampling: the target's chain and Philox draw for the row that will verify this draft
