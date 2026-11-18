@@ -6720,8 +6720,14 @@ __global__ void __launch_bounds__(PG_NTH, 2) p100_moe_tq_kernel(const P100MoeJob
     using blk_t = typename TqInfo<TY>::block_t;
     __shared__ __align__(16) half2 AP[PG_KP][BMT];
     __shared__ __align__(16) half2 BP[PG_KP][BN];
+    __shared__ uint32_t slut[2048];   // the FP16 codebook (8 KB), random lookups served from shared memory
     const P100MoeJob jb = jobs[blockIdx.x];
     if (jb.np <= 0) return;
+    {
+        const uint32_t* g = (const uint32_t*) tq_lut_f16;
+        for (int i = threadIdx.x; i < 2048; i += PG_NTH) slut[i] = g[i];
+        __syncthreads();
+    }
     const int m0 = blockIdx.y * BMT;
     constexpr int PPT = BN / 16, RPT = BMT / 16;
     constexpr int TPP = PG_NTH / BN, KPT = PG_KP / TPP;
@@ -6751,10 +6757,10 @@ __global__ void __launch_bounds__(PG_NTH, 2) p100_moe_tq_kernel(const P100MoeJob
             tq_states4<TY>(b->qs, lane, s);
 #pragma unroll
             for (int i = 0; i < 4; ++i) {
-                float2 a, c;
-                tq_step(s[i], a, c);
-                AP[8 * lp + 2 * i][lr + 64 * rr] = __floats2half2_rn(d * a.x, d * a.y);
-                AP[8 * lp + 2 * i + 1][lr + 64 * rr] = __floats2half2_rn(d * c.x, d * c.y);
+                const uint32_t x = (s[i] & TQ_STATE_MASK) * 0x9e3779b1u;
+                const uint32_t pa = slut[x >> 21], pb = slut[(x >> 10) & 2047u];
+                AP[8 * lp + 2 * i][lr + 64 * rr] = __floats2half2_rn(d * tq_h2f(pa & 0xFFFFu), d * tq_h2f(pa >> 16));
+                AP[8 * lp + 2 * i + 1][lr + 64 * rr] = __floats2half2_rn(d * tq_h2f(pb & 0xFFFFu), d * tq_h2f(pb >> 16));
             }
         }
         if (bpair < jb.np) {
@@ -6829,45 +6835,41 @@ namespace {
 // is 8 lanes (32 rows a 256-thread block, as row_dot_160_sub8); lane t decodes lane t of every 128-value block of the
 // row (16 values: tq_states4 + 4 steps through the FP16 codebook, staged in shared memory) and runs one 8-HFMA2 chain
 // per block and entry, folded into an FP32 sum per block.
-__device__ __forceinline__ void p100_tq_lane16(const uint32_t* __restrict__ slut, uint32_t s, float d, half2& w0, half2& w1) {
+// the step's 4 weights as two half2: the codebook pairs (already half2) times the block scale, one HMUL2 each (no
+// FP16 <-> FP32 conversions: those are low-rate instructions on Pascal)
+__device__ __forceinline__ void p100_tq_lane16(const uint32_t* __restrict__ slut, uint32_t s, half2 hd, half2& w0, half2& w1) {
     const uint32_t x = (s & TQ_STATE_MASK) * 0x9e3779b1u;
-    const uint32_t pa = slut[x >> 21], pb = slut[(x >> 10) & 2047u];
-    w0 = __floats2half2_rn(d * tq_h2f(pa & 0xFFFFu), d * tq_h2f(pa >> 16));
-    w1 = __floats2half2_rn(d * tq_h2f(pb & 0xFFFFu), d * tq_h2f(pb >> 16));
+    uint32_t pa = slut[x >> 21], pb = slut[(x >> 10) & 2047u];
+    w0 = __hmul2(*reinterpret_cast<half2*>(&pa), hd);
+    w1 = __hmul2(*reinterpret_cast<half2*>(&pb), hd);
 }
 __device__ __forceinline__ void p100_stage_lut(uint32_t* slut) {
     const uint32_t* g = (const uint32_t*) tq_lut_f16;
     for (int i = threadIdx.x; i < 2048; i += blockDim.x) slut[i] = g[i];
     __syncthreads();
 }
-// 16 floats of x from p (16-byte aligned) as 8 half2
-__device__ __forceinline__ void p100_x16(const float* __restrict__ p, half2 (&x)[8]) {
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        const float4 f = __ldg(reinterpret_cast<const float4*>(p) + i);
-        x[2 * i] = __floats2half2_rn(f.x, f.y);
-        x[2 * i + 1] = __floats2half2_rn(f.z, f.w);
-    }
-}
 template<int TY, int NC>
 __device__ __forceinline__ void p100_row_dot_f16(const uint32_t* __restrict__ slut, const uint8_t* __restrict__ row, int nblk,
-                                                 const float* const (&xr)[NC], int n, int t, float (&s)[NC]) {
+                                                 const __half* const (&xr)[NC], int n, int t, float (&s)[NC]) {
     using blk_t = typename TqInfo<TY>::block_t;
     const blk_t* b = reinterpret_cast<const blk_t*>(row);
 #pragma unroll
     for (int c = 0; c < NC; ++c) s[c] = 0.0f;
     for (int kb = 0; kb < nblk; ++kb) {
-        const float d = tq_h2f(STRATA_TQ_LD16(&b[kb].d));
+        const unsigned short dbits = (unsigned short) STRATA_TQ_LD16(&b[kb].d);
+        const half2 hd = __half2half2(*reinterpret_cast<const __half*>(&dbits));
         uint32_t st[4];
         tq_states4<TY>(b[kb].qs, t, st);
         half2 w[8];
 #pragma unroll
-        for (int i = 0; i < 4; ++i) p100_tq_lane16(slut, st[i], d, w[2 * i], w[2 * i + 1]);
+        for (int i = 0; i < 4; ++i) p100_tq_lane16(slut, st[i], hd, w[2 * i], w[2 * i + 1]);
 #pragma unroll
         for (int c = 0; c < NC; ++c) {
             if (c < n) {
                 half2 x[8];
-                p100_x16(xr[c] + kb * 128 + 16 * t, x);
+                const uint4* xp = reinterpret_cast<const uint4*>(xr[c] + kb * 128 + 16 * t);
+                *reinterpret_cast<uint4*>(&x[0]) = xp[0];
+                *reinterpret_cast<uint4*>(&x[4]) = xp[1];
                 half2 h = __float2half2_rn(0.0f);
 #pragma unroll
                 for (int i = 0; i < 8; ++i) h = __hfma2(w[i], x[i], h);
@@ -6882,14 +6884,24 @@ __device__ __forceinline__ void p100_row_dot_f16(const uint32_t* __restrict__ sl
         for (int o = 4; o > 0; o >>= 1) s[c] += __shfl_xor_sync(0xffffffffu, s[c], o);
 }
 
+// stage up to 4 entries' input rows (K floats each, 16-byte aligned) into shared memory as half, once per block
+__device__ __forceinline__ void p100_stage_x(__half* xs, const float* const (&src)[4], int n, int K) {
+    const int k2 = K / 2;
+    for (int i = threadIdx.x; i < n * k2; i += blockDim.x) {
+        const int c = i / k2, j = i - c * k2;
+        const float2 v = reinterpret_cast<const float2*>(src[c])[j];
+        reinterpret_cast<half2*>(xs + (size_t) c * K)[j] = __floats2half2_rn(v.x, v.y);
+    }
+}
 template<int TG>
 __global__ void __launch_bounds__(256) p100_gu_dec_kernel(const unsigned long long* __restrict__ grp_ptr, const int32_t* __restrict__ grp_start,
                                                           const int32_t* __restrict__ n_groups, const int32_t* __restrict__ ent_tok,
                                                           const float* __restrict__ xf, NativeExpertLayout L, float* __restrict__ gate,
                                                           float* __restrict__ up) {
     __shared__ uint32_t slut[2048];
+    __shared__ __align__(16) __half xs[4 * 2560];
     const int ng = *n_groups;
-    if (blockIdx.y >= ng) return;
+    if (blockIdx.y >= ng || L.n_embd > 2560) return;
     p100_stage_lut(slut);
     const int t = threadIdx.x & 7, row = blockIdx.x * 32 + (threadIdx.x >> 3);
     const bool live = row < 2 * L.n_ff;
@@ -6897,14 +6909,18 @@ __global__ void __launch_bounds__(256) p100_gu_dec_kernel(const unsigned long lo
     const int r = is_up ? row - (int) L.n_ff : row;
     const size_t w_off = (is_up ? L.up_off : 0) + (size_t) (live ? r : 0) * L.gu_row;
     float* dst = is_up ? up : gate;
-    const int nblk = (int) (L.n_embd / 128);
+    const int K = (int) L.n_embd, nblk = K / 128;
     for (int g = blockIdx.y; g < ng; g += gridDim.y) {
         const uint8_t* wr = (const uint8_t*) grp_ptr[g] + w_off;
         const int e0 = grp_start[g], e1 = grp_start[g + 1];
         for (int e = e0; e < e1; e += 4) {
             const int n = min(4, e1 - e);
-            const float* const xr[4] = { xf + (size_t) ent_tok[e] * L.n_embd, xf + (size_t) ent_tok[e + (n > 1)] * L.n_embd,
-                                         xf + (size_t) ent_tok[e + (n > 2 ? 2 : 0)] * L.n_embd, xf + (size_t) ent_tok[e + (n > 3 ? 3 : 0)] * L.n_embd };
+            const float* const src[4] = { xf + (size_t) ent_tok[e] * K, xf + (size_t) ent_tok[e + (n > 1)] * K,
+                                          xf + (size_t) ent_tok[e + (n > 2 ? 2 : 0)] * K, xf + (size_t) ent_tok[e + (n > 3 ? 3 : 0)] * K };
+            __syncthreads();
+            p100_stage_x(xs, src, n, K);
+            __syncthreads();
+            const __half* const xr[4] = { xs, xs + K, xs + 2 * K, xs + 3 * K };
             float s4[4];
             p100_row_dot_f16<TG, 4>(slut, wr, nblk, xr, n, t, s4);
             if (live && t < n) dst[(size_t) (e + t) * L.n_ff + r] = s4[t];
@@ -6917,19 +6933,24 @@ __global__ void __launch_bounds__(256) p100_down_dec_kernel(const unsigned long 
                                                             const int32_t* __restrict__ n_groups, const int32_t* __restrict__ ent_dst,
                                                             const float* __restrict__ h, NativeExpertLayout L, float* __restrict__ out) {
     __shared__ uint32_t slut[2048];
+    __shared__ __align__(16) __half xs[4 * 1024];
     const int ng = *n_groups;
-    if (blockIdx.y >= ng) return;
+    if (blockIdx.y >= ng || L.n_ff > 1024) return;
     p100_stage_lut(slut);
     const int t = threadIdx.x & 7, row = blockIdx.x * 32 + (threadIdx.x >> 3);
     const bool live = row < L.n_embd;
-    const int nblk = (int) (L.n_ff / 128);
+    const int K = (int) L.n_ff, nblk = K / 128;
     for (int g = blockIdx.y; g < ng; g += gridDim.y) {
         const uint8_t* wr = (const uint8_t*) grp_ptr[g] + L.down_off + (size_t) (live ? row : 0) * L.d_row;
         const int e0 = grp_start[g], e1 = grp_start[g + 1];
         for (int e = e0; e < e1; e += 4) {
             const int n = min(4, e1 - e);
-            const float* const xr[4] = { h + (size_t) e * L.n_ff, h + (size_t) (e + (n > 1)) * L.n_ff,
-                                         h + (size_t) (e + (n > 2 ? 2 : 0)) * L.n_ff, h + (size_t) (e + (n > 3 ? 3 : 0)) * L.n_ff };
+            const float* const src[4] = { h + (size_t) e * K, h + (size_t) (e + (n > 1)) * K,
+                                          h + (size_t) (e + (n > 2 ? 2 : 0)) * K, h + (size_t) (e + (n > 3 ? 3 : 0)) * K };
+            __syncthreads();
+            p100_stage_x(xs, src, n, K);
+            __syncthreads();
+            const __half* const xr[4] = { xs, xs + K, xs + 2 * K, xs + 3 * K };
             float s4[4];
             p100_row_dot_f16<TD, 4>(slut, wr, nblk, xr, n, t, s4);
             if (live && t < n) out[(size_t) ent_dst[e + t] * L.n_embd + row] = s4[t];
@@ -6943,8 +6964,9 @@ bool p100_dec_f16_on() {
     return false;
 #else
     static const bool on = [] {
-        // opt-in (research): measured slower than the tuned q8_1 decode rows on Gyro-S (48.0 -> 41.0 tok/s, A B B A): those
-        // stage the activations in shared memory once and decode each weight part once for up to 4 entries
+        // opt-in (research): slower than the tuned q8_1 decode rows on Gyro-S (A B B A: 48.1 -> 43.1 tok/s with half2 weights
+        // and FP16 inputs staged once per block; 41 in the first version): most expert groups hold one entry in a verify window,
+        // so a block pays the codebook and input staging for one dot product per row
         const char* e = std::getenv("STRATA_P100_DEC_F16");
         if (!(e && e[0] == '1')) return false;
         int dev = 0, major = 0, minor = 0;
@@ -6959,13 +6981,19 @@ bool p100_dec_f16_on() {
 #endif
 }
 
+// STRATA_P100_DEC_GY: at most this many block rows of expert groups (each block loops over its groups), so a block's
+// staged codebook serves several groups (default 8)
+unsigned p100_dec_gy(unsigned gy) {
+    static const unsigned cap = [] { const char* e = std::getenv("STRATA_P100_DEC_GY"); return e ? (unsigned) std::max(1, std::atoi(e)) : 8u; }();
+    return std::min(gy, cap);
+}
 bool p100_dec_gu(const NativeExpertLayout& L, unsigned gy, cudaStream_t s, const unsigned long long* grp_ptr, const int32_t* grp_start,
                  const int32_t* n_groups, const int32_t* ent_tok, const float* xf, float* gate, float* up) {
 #if defined(__HIPCC__)
     return false;
 #else
     if (L.gu_type != 145 || L.n_embd % 128 != 0 || L.tail_off || L.gu_nib || (2 * L.n_ff) % 32 != 0 || !p100_dec_f16_on()) return false;
-    p100_gu_dec_kernel<145><<<dim3((unsigned) (2 * L.n_ff / 32), gy), 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, xf, L, gate, up);
+    p100_gu_dec_kernel<145><<<dim3((unsigned) (2 * L.n_ff / 32), p100_dec_gy(gy)), 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, xf, L, gate, up);
     return true;
 #endif
 }
@@ -6975,7 +7003,7 @@ bool p100_dec_down(const NativeExpertLayout& L, unsigned gy, cudaStream_t s, con
     return false;
 #else
     if (L.d_type != 146 || L.n_ff % 128 != 0 || L.tail_off || L.n_embd % 32 != 0 || !p100_dec_f16_on()) return false;
-    p100_down_dec_kernel<146><<<dim3((unsigned) (L.n_embd / 32), gy), 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, h, L, out);
+    p100_down_dec_kernel<146><<<dim3((unsigned) (L.n_embd / 32), p100_dec_gy(gy)), 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, h, L, out);
     return true;
 #endif
 }
