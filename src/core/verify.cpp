@@ -42,6 +42,7 @@
 #include "strata/kernels/qsa_prompt_attn.hpp"
 #include "strata/kernels/fused_gr.hpp"
 #include "strata/kernels/route_prior.hpp"
+#include "strata/kernels/p100_mmvq_f16.hpp"
 #include "strata/kernels/cvec.hpp"
 #include "strata/kernels/gr.hpp"
 #include "strata/kernels/kv_q4.hpp"
@@ -1088,6 +1089,9 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         xq_ = b.take<uint8_t>(strata::kernels::native_q8_1_bytes(max_in, qcols));
         sh_xq_ = b.take<uint8_t>(strata::kernels::native_q8_1_bytes(max_in, qcols));
         xil_ = b.take<uint8_t>(strata::kernels::native_q8_1_il_bytes(max_in, std::max(4, qcols)));   // 147-verify: 5-8 columns too
+        // p100k: the FP16 form of one projection input (p100_mmvq_f16), when the card is a Tesla P100
+        p100_scr_bytes_ = strata::kernels::p100_mmvq_f16_on() ? strata::kernels::p100_mmvq_f16_scratch_bytes(max_in, std::min(qcols, 12)) : 0;
+        p100_scr_ = p100_scr_bytes_ ? b.take<uint8_t>(p100_scr_bytes_) : nullptr;
         qkv_L_ = b.take<float>(nG * T * C); h_L_ = b.take<float>(nG * T * C);
         gate_L_ = b.take<float>(nG * T * HV); beta_L_ = b.take<float>(nG * T * HV);
         z_ = b.take<float>(T * ZV); y_ = b.take<float>(T * ZV); y_dummy_ = b.take<float>(T * ZV);
@@ -1635,10 +1639,12 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         stamp(l, 1, grp);
         float* xm = mixed_ + tb * N;
         bool il_ready = false;   // xil_ holds xq_'s interleaved copy (reset whenever xq_ is rewritten)
+        bool f16_ready = false;  // p100k: the FP16 copy of xq_'s input is prepared (p100_mmvq_f16_prep)
         // a projection input's q8_1 blocks and their interleaved copy in one launch (native_quantize_q8_1_il, the same
         // bytes): Turing default (+0.5..+1 % decode, two launches fewer per GDN layer and per QSA layer); STRATA_QIL=0 / 1
         // forces it off / on
         auto quant_in = [&](const float* x, int n_in) {
+            f16_ready = false;
 #if !defined(STRATA_USE_HIP)
             static const int qil_env = [] { const char* v = std::getenv("STRATA_QIL"); return v != nullptr ? std::atoi(v) : -1; }();
             const bool qil = qil_env >= 0 ? qil_env != 0 : device_is_sm75();
@@ -1650,8 +1656,25 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
 #endif
             native_quantize_q8_1(x, xq_, n_in, n, cs);
             il_ready = false;
+#if !defined(STRATA_USE_HIP)
+            // p100k: the FP16 form of the same input for the dense Q5_K / Q6_K mat-vecs (2..12 columns), next to q8_1
+            f16_ready = false;
+            if (n >= 2 && strata::kernels::p100_mmvq_f16_on()) {
+                f16_ready = strata::kernels::p100_mmvq_f16_prep(x, n_in, n, p100_scr_, p100_scr_bytes_, cs);
+            }
+#endif
+        };
+        // p100k: only the FP16 copy (xq_ was written by a fused kernel from the same input)
+        auto f16_only = [&](const float* x, int n_in) {
+            f16_ready = false;
+#if !defined(STRATA_USE_HIP)
+            if (n >= 2 && strata::kernels::p100_mmvq_f16_on()) {
+                f16_ready = strata::kernels::p100_mmvq_f16_prep(x, n_in, n, p100_scr_, p100_scr_bytes_, cs);
+            }
+#endif
         };
         auto mm = [&](const WeightRef* w, float* out, int n_in, int n_out) {
+            if (f16_ready && strata::kernels::p100_mmvq_f16(w->native_type, w->native_data, out, n_in, n_out, n, p100_scr_, cs)) return;
             if (g_mmvq_il() && strata::kernels::native_mmvq_il_supported(w->native_type, n, n_out)) {
                 if (!il_ready && n >= 2) {   // one column reads the plain q8_1 blocks
                     strata::kernels::native_q8_1_interleave(xq_, xil_, n_in, n, cs);
@@ -1690,6 +1713,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     if (cudaEventRecord(mjoin_, side_) != cudaSuccess) { err = "verify: the GDN gates' branch could not join"; return false; }
                 }
                 if (!q8_attn) quant_in(xm, (int) N);
+                else f16_only(xm, (int) N);
                 if (side_proj) {   // the gate projection (compute-bound for i-quants) beside qkv and the conv
                     // the branch reads F4's interleaved copy too (written on cs before the fork; bitwise native_mmvq's
                     // output), and qkv is recorded before the branch's launch, so its grid is dispatched first and the
@@ -1800,7 +1824,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 // STRATA_QFUSE: done above by gdn_step_norm_multi - but a batch's per-slot recurrence passes it no q8_1
                 // destination (#1139: the out-projection read stale bytes), so that case quantizes here as without it
                 if (!g_qfuse() || batch_rec_) quant_in(y_ + (size_t) tb * ZV, (int) ZV);
-                else il_ready = false;
+                else { il_ready = false; f16_ready = false; }
                 mm(wout, bo_ + tb * N, (int) ZV, (int) N);
             } else {
                 // ======================= QSA =======================
@@ -1848,6 +1872,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 }();
                 const bool qb = dec_batch && n > 1 && native_qsa_enabled() && native_rope_enabled() && (!st.kv_q4 || qb_q4);
                 if (!q8_attn) quant_in(xm, (int) N);
+                else f16_only(xm, (int) N);
                 // STRATA_DF_BRANCH: the query side (q and its norm/RoPE/rotation on side 0, the indexer query on side 1)
                 // beside the K/V side; the indexer query joins before the block scores, the query before attention
                 const bool qbr = br && qb;
