@@ -117,6 +117,39 @@ __global__ void bf16_to_f16_rows(const uint16_t* __restrict__ s, __half* __restr
     }
 }
 #endif
+#if !defined(__HIPCC__) && defined(STRATA_EXPERIMENTAL_SM60)
+// p100k (Tesla P100, compute capability 6.0): STRATA_P100_HGEMM.  cuBLAS's FP16 GEMM with CUBLAS_COMPUTE_32F runs the
+// maxwell_sgemm_fp16 kernels (FP16 loads, FP32 FMA); CUBLAS_COMPUTE_16F runs HGEMM at the P100's 2x FP16 rate.  The
+// output is written as FP16 at the start of each FP32 row of Y (ldc = 2 ldy halves) and widened in place, as the HIP
+// path's widen_rows_f16: a row is walked from its end in blocks, so a block only overwrites halves already read.
+__global__ void p100_widen_rows_f16(float* __restrict__ Y, int64_t n, int64_t ldy) {
+    float* y = Y + (int64_t) blockIdx.x * ldy;
+    const __half* h = reinterpret_cast<const __half*>(y);
+    const int64_t nb = (n + blockDim.x - 1) / blockDim.x;
+    for (int64_t b = nb - 1; b >= 0; --b) {
+        const int64_t c = b * blockDim.x + threadIdx.x;
+        const float v = c < n ? __half2float(h[c]) : 0.0f;
+        __syncthreads();
+        if (c < n) y[c] = v;
+        __syncthreads();
+    }
+}
+// on by default on compute capability 6.0; STRATA_P100_HGEMM=0 turns it off (the FP32-compute call, for A/B)
+bool p100_hgemm_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("STRATA_P100_HGEMM");
+        if (e && e[0] == '0') return false;
+        int dev = 0, major = 0, minor = 0;
+        if (cudaGetDevice(&dev) != cudaSuccess) return false;
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
+        const bool v = major == 6 && minor == 0;
+        if (v) std::fprintf(stderr, "prefill gemm: FP16 GEMMs as HGEMM (CUBLAS_COMPUTE_16F, Tesla P100; STRATA_P100_HGEMM=0 for FP32 compute)\n");
+        return v;
+    }();
+    return on;
+}
+#endif
 }  // namespace
 
 void gemm_set_f16_range(bool on) {
@@ -1215,6 +1248,19 @@ void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_
                       beta, stream_)) {
         STRATA_ABSORB_HIPBLAS_STICKY("hipBLASLt f16");
         return;
+    }
+#endif
+#if !defined(__HIPCC__) && defined(STRATA_EXPERIMENTAL_SM60)
+    if (beta == 0.0f && p100_hgemm_on()) {
+        const __half h_one = __float2half(1.0f), h_zero = __float2half(0.0f);
+        const cublasStatus_t hs = cublasGemmEx((cublasHandle_t) handle_, CUBLAS_OP_T, CUBLAS_OP_N, (int) N, (int) T, (int) K,
+                                               &h_one, W, CUDA_R_16F, (int) K, X, CUDA_R_16F, (int) K, &h_zero, Y,
+                                               CUDA_R_16F, (int) (2 * ldy), CUBLAS_COMPUTE_16F, CUBLAS_GEMM_DEFAULT);
+        if (hs == CUBLAS_STATUS_SUCCESS) {
+            p100_widen_rows_f16<<<(unsigned) T, 256, 0, (cudaStream_t) stream_>>>(Y, N, ldy);
+            return;
+        }
+        // a shape cuBLAS refuses as HGEMM: the FP32-compute call below
     }
 #endif
 #if !defined(__HIPCC__) && defined(STRATA_EXPERIMENTAL_SM60)
