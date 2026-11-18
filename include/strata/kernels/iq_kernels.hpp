@@ -93,7 +93,7 @@ void iq_xmx_grouped(int ty, const uint8_t* const* a, const uint8_t* const* b, co
 void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start,
                            const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,
                            int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream,
-                           int64_t grid_groups = 0);
+                           int64_t grid_groups = 0, const float* x_f32 = nullptr);   // x_f32 (p100k): the float input rows, when the caller holds them
 /// OWN-I8 (research, off by default): the same call as `native_expert_grouped` on our own int8 dot-product kernels - a tile of
 /// 64 weight rows x 32..64 entries per block, each weight sub-block decoded once per tile into int8 in shared memory, `dp4a`
 /// products, SwiGLU and the q8_1 quantization of H in the gate/up epilogue (gate/up never go to memory).  For cards with no

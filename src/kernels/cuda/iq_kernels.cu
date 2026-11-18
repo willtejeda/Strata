@@ -6426,10 +6426,15 @@ bool native_expert_expdec_takes(const NativeExpertLayout& L, bool& gu, bool& dow
     return gu || down;
 }
 
+// p100k: FP16 trellis decode rows (defined with the kernels below)
+bool p100_dec_gu(const NativeExpertLayout& L, unsigned gy, cudaStream_t s, const unsigned long long* grp_ptr, const int32_t* grp_start,
+                 const int32_t* n_groups, const int32_t* ent_tok, const float* xf, float* gate, float* up);
+bool p100_dec_down(const NativeExpertLayout& L, unsigned gy, cudaStream_t s, const unsigned long long* grp_ptr, const int32_t* grp_start,
+                   const int32_t* n_groups, const int32_t* ent_dst, const float* h, float* out);
 void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start,
                            const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,
                            int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream,
-                           int64_t grid_groups) {
+                           int64_t grid_groups, const float* x_f32) {
     if (cap_groups <= 0 || cap_entries <= 0) return;
     strata::dispatch::kernel(strata::dispatch::kExpert, 0, L.gu_type, (int) L.n_embd, (int) L.n_ff, L.d_type);   // BW-MEASURE: one grouped expert call
     if (L.n_ff % 32 != 0) { std::fprintf(stderr, "native_expert_grouped: n_ff %lld\n", (long long) L.n_ff); std::exit(1); }
@@ -6442,6 +6447,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     float* h = (float*) ((uint8_t*) scratch + 2 * fa);
     block_q8_1* hq = (block_q8_1*) ((uint8_t*) scratch + 3 * fa);
     const auto* X = (const block_q8_1*) x_q8_1;
+    bool h_ready = false;
 #if !STRATA_EXPERT_NIBBLE_BUILT
     if (L.gu_nib) {   // STRATA_EXPERT_NIBBLE's slots: the switch is refused at start in a build without the kernels
         std::fprintf(stderr, "native_expert_grouped: 4-bit gate/up slots are not built into this engine\n");
@@ -6608,7 +6614,8 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
                       n_groups, ent_tok, X, gate, up);
     else
 #endif
-    if (!expdec_gu(L, gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_tok, X, gate, up))   // STRATA_EXPDEC=1
+    if (!(x_f32 && p100_dec_gu(L, ggu.y, s, grp_ptr, grp_start, n_groups, ent_tok, x_f32, gate, up)) &&   // p100k: FP16 trellis rows
+        !expdec_gu(L, gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_tok, X, gate, up))   // STRATA_EXPDEC=1
     switch (L.gu_type) {
 #define STRATA_GU(T) case T: launch_gu<T>(ggu, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
         STRATA_GU_FMTS(STRATA_GU)
@@ -6620,6 +6627,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
 #endif
     check("native_expert_grouped/gu");
     if (g_exp_phase == 3) return;   // the bench: gate/up only
+    h_ready = false;
     const long long nh = (long long) cap_entries * L.n_ff;
 #if defined(STRATA_HIP_GFX906)
     // gfx906: the separate SwiGLU and q8_1 passes stay the default (the A/B baseline); the RDNA one-pass
@@ -6631,6 +6639,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
 #endif
     // APR: Hadamard-folded down weights take the rotated h, so h exists as floats first (the separate passes)
     if (sw_v1 || L.had_block > 0) {
+        h_ready = true;   // p100k: the FP16 down rows read h (rotated where folded)
         swiglu_entries_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, h, nh);
         if (L.had_block > 0)   // APR: the down weights are Hadamard-folded, so is their input (in place, every entry row)
             hadamard_rows(h, h, cap_entries, L.n_ff, L.had_block, L.d_signs, s);
@@ -6682,7 +6691,8 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     } else
 #undef STRATA_D_AMD
 #endif
-    if (!expdec_down(L, gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_dst, hq, out))   // STRATA_EXPDEC=1
+    if (!(h_ready && p100_dec_down(L, gd.y, s, grp_ptr, grp_start, n_groups, ent_dst, h, out)) &&   // p100k: FP16 trellis rows
+        !expdec_down(L, gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_dst, hq, out))   // STRATA_EXPDEC=1
     switch (L.d_type) {
 #define STRATA_DOWN(T) case T: launch_down<T>(gd, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
         STRATA_D_FMTS(STRATA_DOWN)
@@ -6812,6 +6822,163 @@ void p100_moe_tq_launch(const P100MoeJob* jobs, int njobs, int bn, const void* X
     else p100_moe_tq_kernel<TY, 16, 64, GU><<<grid, PG_NTH, 0, s>>>(jobs, K, xh, Y, ldy);
 }
 }  // namespace
+
+namespace {
+// ---- p100k decode experts (the verify windows): FP16 trellis rows against the float inputs the folded layers already
+// hold (the rotated x rows for gate/up, the rotated h rows for down), instead of q8_1 inputs and emulated dp4a. A row
+// is 8 lanes (32 rows a 256-thread block, as row_dot_160_sub8); lane t decodes lane t of every 128-value block of the
+// row (16 values: tq_states4 + 4 steps through the FP16 codebook, staged in shared memory) and runs one 8-HFMA2 chain
+// per block and entry, folded into an FP32 sum per block.
+__device__ __forceinline__ void p100_tq_lane16(const uint32_t* __restrict__ slut, uint32_t s, float d, half2& w0, half2& w1) {
+    const uint32_t x = (s & TQ_STATE_MASK) * 0x9e3779b1u;
+    const uint32_t pa = slut[x >> 21], pb = slut[(x >> 10) & 2047u];
+    w0 = __floats2half2_rn(d * tq_h2f(pa & 0xFFFFu), d * tq_h2f(pa >> 16));
+    w1 = __floats2half2_rn(d * tq_h2f(pb & 0xFFFFu), d * tq_h2f(pb >> 16));
+}
+__device__ __forceinline__ void p100_stage_lut(uint32_t* slut) {
+    const uint32_t* g = (const uint32_t*) tq_lut_f16;
+    for (int i = threadIdx.x; i < 2048; i += blockDim.x) slut[i] = g[i];
+    __syncthreads();
+}
+// 16 floats of x from p (16-byte aligned) as 8 half2
+__device__ __forceinline__ void p100_x16(const float* __restrict__ p, half2 (&x)[8]) {
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const float4 f = __ldg(reinterpret_cast<const float4*>(p) + i);
+        x[2 * i] = __floats2half2_rn(f.x, f.y);
+        x[2 * i + 1] = __floats2half2_rn(f.z, f.w);
+    }
+}
+template<int TY, int NC>
+__device__ __forceinline__ void p100_row_dot_f16(const uint32_t* __restrict__ slut, const uint8_t* __restrict__ row, int nblk,
+                                                 const float* const (&xr)[NC], int n, int t, float (&s)[NC]) {
+    using blk_t = typename TqInfo<TY>::block_t;
+    const blk_t* b = reinterpret_cast<const blk_t*>(row);
+#pragma unroll
+    for (int c = 0; c < NC; ++c) s[c] = 0.0f;
+    for (int kb = 0; kb < nblk; ++kb) {
+        const float d = tq_h2f(STRATA_TQ_LD16(&b[kb].d));
+        uint32_t st[4];
+        tq_states4<TY>(b[kb].qs, t, st);
+        half2 w[8];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) p100_tq_lane16(slut, st[i], d, w[2 * i], w[2 * i + 1]);
+#pragma unroll
+        for (int c = 0; c < NC; ++c) {
+            if (c < n) {
+                half2 x[8];
+                p100_x16(xr[c] + kb * 128 + 16 * t, x);
+                half2 h = __float2half2_rn(0.0f);
+#pragma unroll
+                for (int i = 0; i < 8; ++i) h = __hfma2(w[i], x[i], h);
+                const float2 f = __half22float2(h);
+                s[c] += f.x + f.y;
+            }
+        }
+    }
+#pragma unroll
+    for (int c = 0; c < NC; ++c)
+#pragma unroll
+        for (int o = 4; o > 0; o >>= 1) s[c] += __shfl_xor_sync(0xffffffffu, s[c], o);
+}
+
+template<int TG>
+__global__ void __launch_bounds__(256) p100_gu_dec_kernel(const unsigned long long* __restrict__ grp_ptr, const int32_t* __restrict__ grp_start,
+                                                          const int32_t* __restrict__ n_groups, const int32_t* __restrict__ ent_tok,
+                                                          const float* __restrict__ xf, NativeExpertLayout L, float* __restrict__ gate,
+                                                          float* __restrict__ up) {
+    __shared__ uint32_t slut[2048];
+    const int ng = *n_groups;
+    if (blockIdx.y >= ng) return;
+    p100_stage_lut(slut);
+    const int t = threadIdx.x & 7, row = blockIdx.x * 32 + (threadIdx.x >> 3);
+    const bool live = row < 2 * L.n_ff;
+    const bool is_up = row >= L.n_ff;
+    const int r = is_up ? row - (int) L.n_ff : row;
+    const size_t w_off = (is_up ? L.up_off : 0) + (size_t) (live ? r : 0) * L.gu_row;
+    float* dst = is_up ? up : gate;
+    const int nblk = (int) (L.n_embd / 128);
+    for (int g = blockIdx.y; g < ng; g += gridDim.y) {
+        const uint8_t* wr = (const uint8_t*) grp_ptr[g] + w_off;
+        const int e0 = grp_start[g], e1 = grp_start[g + 1];
+        for (int e = e0; e < e1; e += 4) {
+            const int n = min(4, e1 - e);
+            const float* const xr[4] = { xf + (size_t) ent_tok[e] * L.n_embd, xf + (size_t) ent_tok[e + (n > 1)] * L.n_embd,
+                                         xf + (size_t) ent_tok[e + (n > 2 ? 2 : 0)] * L.n_embd, xf + (size_t) ent_tok[e + (n > 3 ? 3 : 0)] * L.n_embd };
+            float s4[4];
+            p100_row_dot_f16<TG, 4>(slut, wr, nblk, xr, n, t, s4);
+            if (live && t < n) dst[(size_t) (e + t) * L.n_ff + r] = s4[t];
+        }
+    }
+}
+
+template<int TD>
+__global__ void __launch_bounds__(256) p100_down_dec_kernel(const unsigned long long* __restrict__ grp_ptr, const int32_t* __restrict__ grp_start,
+                                                            const int32_t* __restrict__ n_groups, const int32_t* __restrict__ ent_dst,
+                                                            const float* __restrict__ h, NativeExpertLayout L, float* __restrict__ out) {
+    __shared__ uint32_t slut[2048];
+    const int ng = *n_groups;
+    if (blockIdx.y >= ng) return;
+    p100_stage_lut(slut);
+    const int t = threadIdx.x & 7, row = blockIdx.x * 32 + (threadIdx.x >> 3);
+    const bool live = row < L.n_embd;
+    const int nblk = (int) (L.n_ff / 128);
+    for (int g = blockIdx.y; g < ng; g += gridDim.y) {
+        const uint8_t* wr = (const uint8_t*) grp_ptr[g] + L.down_off + (size_t) (live ? row : 0) * L.d_row;
+        const int e0 = grp_start[g], e1 = grp_start[g + 1];
+        for (int e = e0; e < e1; e += 4) {
+            const int n = min(4, e1 - e);
+            const float* const xr[4] = { h + (size_t) e * L.n_ff, h + (size_t) (e + (n > 1)) * L.n_ff,
+                                         h + (size_t) (e + (n > 2 ? 2 : 0)) * L.n_ff, h + (size_t) (e + (n > 3 ? 3 : 0)) * L.n_ff };
+            float s4[4];
+            p100_row_dot_f16<TD, 4>(slut, wr, nblk, xr, n, t, s4);
+            if (live && t < n) out[(size_t) ent_dst[e + t] * L.n_embd + row] = s4[t];
+        }
+    }
+}
+}  // namespace
+
+bool p100_dec_f16_on() {
+#if defined(__HIPCC__)
+    return false;
+#else
+    static const bool on = [] {
+        // opt-in (research): measured slower than the tuned q8_1 decode rows on Gyro-S (48.0 -> 41.0 tok/s, A B B A): those
+        // stage the activations in shared memory once and decode each weight part once for up to 4 entries
+        const char* e = std::getenv("STRATA_P100_DEC_F16");
+        if (!(e && e[0] == '1')) return false;
+        int dev = 0, major = 0, minor = 0;
+        if (cudaGetDevice(&dev) != cudaSuccess) return false;
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
+        const bool v = major == 6 && minor == 0;
+        if (v) std::fprintf(stderr, "experts: trellis rows in FP16 in the verify windows (STRATA_P100_DEC_F16=1, research)\n");
+        return v;
+    }();
+    return on;
+#endif
+}
+
+bool p100_dec_gu(const NativeExpertLayout& L, unsigned gy, cudaStream_t s, const unsigned long long* grp_ptr, const int32_t* grp_start,
+                 const int32_t* n_groups, const int32_t* ent_tok, const float* xf, float* gate, float* up) {
+#if defined(__HIPCC__)
+    return false;
+#else
+    if (L.gu_type != 145 || L.n_embd % 128 != 0 || L.tail_off || L.gu_nib || (2 * L.n_ff) % 32 != 0 || !p100_dec_f16_on()) return false;
+    p100_gu_dec_kernel<145><<<dim3((unsigned) (2 * L.n_ff / 32), gy), 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, xf, L, gate, up);
+    return true;
+#endif
+}
+bool p100_dec_down(const NativeExpertLayout& L, unsigned gy, cudaStream_t s, const unsigned long long* grp_ptr, const int32_t* grp_start,
+                   const int32_t* n_groups, const int32_t* ent_dst, const float* h, float* out) {
+#if defined(__HIPCC__)
+    return false;
+#else
+    if (L.d_type != 146 || L.n_ff % 128 != 0 || L.tail_off || L.n_embd % 32 != 0 || !p100_dec_f16_on()) return false;
+    p100_down_dec_kernel<146><<<dim3((unsigned) (L.n_embd / 32), gy), 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, h, L, out);
+    return true;
+#endif
+}
 
 bool p100_moe_tq_supported(int type, int K, int M) {
 #if defined(__HIPCC__)
