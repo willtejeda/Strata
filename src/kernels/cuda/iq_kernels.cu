@@ -6753,14 +6753,24 @@ __global__ void __launch_bounds__(PG_NTH, 2) p100_moe_tq_kernel(const P100MoeJob
             }
             const blk_t* b = rowp + kb;
             const float d = tq_h2f(STRATA_TQ_LD16(&b->d));
-            uint32_t s[4];
-            tq_states4<TY>(b->qs, lane, s);
+            if constexpr (TY >= 147) {   // TQP (pair trellis, Gyro-Coder-L): 8 steps of 2 weights, the first pair (dq_tqp's values)
+                uint32_t s[8];
+                tqp_states8<TY>(b->qs, lane, s);
 #pragma unroll
-            for (int i = 0; i < 4; ++i) {
-                const uint32_t x = (s[i] & TQ_STATE_MASK) * 0x9e3779b1u;
-                const uint32_t pa = slut[x >> 21], pb = slut[(x >> 10) & 2047u];
-                AP[8 * lp + 2 * i][lr + 64 * rr] = __floats2half2_rn(d * tq_h2f(pa & 0xFFFFu), d * tq_h2f(pa >> 16));
-                AP[8 * lp + 2 * i + 1][lr + 64 * rr] = __floats2half2_rn(d * tq_h2f(pb & 0xFFFFu), d * tq_h2f(pb >> 16));
+                for (int i = 0; i < 8; ++i) {
+                    const uint32_t pa = slut[((s[i] & TQ_STATE_MASK) * 0x9e3779b1u) >> 21];
+                    AP[8 * lp + i][lr + 64 * rr] = __floats2half2_rn(d * tq_h2f(pa & 0xFFFFu), d * tq_h2f(pa >> 16));
+                }
+            } else {
+                uint32_t s[4];
+                tq_states4<TY>(b->qs, lane, s);
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const uint32_t x = (s[i] & TQ_STATE_MASK) * 0x9e3779b1u;
+                    const uint32_t pa = slut[x >> 21], pb = slut[(x >> 10) & 2047u];
+                    AP[8 * lp + 2 * i][lr + 64 * rr] = __floats2half2_rn(d * tq_h2f(pa & 0xFFFFu), d * tq_h2f(pa >> 16));
+                    AP[8 * lp + 2 * i + 1][lr + 64 * rr] = __floats2half2_rn(d * tq_h2f(pb & 0xFFFFu), d * tq_h2f(pb >> 16));
+                }
             }
         }
         if (bpair < jb.np) {
@@ -7012,7 +7022,7 @@ bool p100_moe_tq_supported(int type, int K, int M) {
 #if defined(__HIPCC__)
     return false;
 #else
-    return (type == 145 || type == 146) && K % 128 == 0 && M % 64 == 0 && K > 0 && M > 0;
+    return (type == 145 || type == 146 || type == 147 || type == 148 || type == 149) && K % 128 == 0 && M % 64 == 0 && K > 0 && M > 0;
 #endif
 }
 
@@ -7023,12 +7033,12 @@ bool p100_moe_tq_gemm(int type, const P100MoeJob* jobs_dev, int njobs, int bn, c
 #else
     if (!p100_moe_tq_supported(type, K, M) || njobs <= 0 || (bn != 16 && bn != 32 && bn != 64)) return false;
     const auto s = static_cast<cudaStream_t>(stream);
-    if (type == 145) {
-        if (gate_up) p100_moe_tq_launch<145, true>(jobs_dev, njobs, bn, X, K, Y, ldy, M, s);
-        else p100_moe_tq_launch<145, false>(jobs_dev, njobs, bn, X, K, Y, ldy, M, s);
-    } else {
-        if (gate_up) p100_moe_tq_launch<146, true>(jobs_dev, njobs, bn, X, K, Y, ldy, M, s);
-        else p100_moe_tq_launch<146, false>(jobs_dev, njobs, bn, X, K, Y, ldy, M, s);
+    switch (type) {
+#define STRATA_PTQ(T) case T: if (gate_up) p100_moe_tq_launch<T, true>(jobs_dev, njobs, bn, X, K, Y, ldy, M, s); \
+                              else p100_moe_tq_launch<T, false>(jobs_dev, njobs, bn, X, K, Y, ldy, M, s); break;
+        STRATA_PTQ(145) STRATA_PTQ(146) STRATA_PTQ(147) STRATA_PTQ(148) STRATA_PTQ(149)
+#undef STRATA_PTQ
+        default: return false;
     }
     return cudaPeekAtLastError() == cudaSuccess;
 #endif
