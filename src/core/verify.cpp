@@ -1725,7 +1725,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     }
                     if (!branch(pfork_, cs, side2_, "fork")) return false;
                     mm(wqkv, qkv + (size_t) tb * C, (int) N, (int) C);
-                    if (g_il) strata::kernels::native_mmvq_il(wg->native_type, wg->native_data, xq_, xil_, z_ + (size_t) tb * ZV,
+                    if (f16_ready && strata::kernels::p100_mmvq_f16(wg->native_type, wg->native_data, z_ + (size_t) tb * ZV,
+                                                                    (int) N, (int) ZV, n, p100_scr_, side2_)) {
+                        // p100k: FP16 (the input was prepared on cs before the fork)
+                    } else if (g_il) strata::kernels::native_mmvq_il(wg->native_type, wg->native_data, xq_, xil_, z_ + (size_t) tb * ZV,
                                                               (int) N, (int) ZV, n, side2_);
                     else native_mmvq(wg->native_type, wg->native_data, xq_, z_ + (size_t) tb * ZV, (int) N, (int) ZV, n, side2_);
                     if (cudaEventRecord(pjoin_, side2_) != cudaSuccess) { err = "verify: the gate projection's branch could not join"; return false; }
@@ -1965,7 +1968,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                   strata::kernels::native_mmvq_il_supported(wq->native_type, n, (int) (NH * 2 * HD));
                 auto q_chain = [&](cudaStream_t ns) -> bool {
                     if (ns == cs) mm(wq, qfull_ + tb * NH * 2 * HD, (int) N, (int) (NH * 2 * HD));
-                    else if (q_il) strata::kernels::native_mmvq_il(wq->native_type, wq->native_data, xq_, xil_,
+                    else if (f16_ready && strata::kernels::p100_mmvq_f16(wq->native_type, wq->native_data, qfull_ + tb * NH * 2 * HD,
+                                                                         (int) N, (int) (NH * 2 * HD), n, p100_scr_, ns)) {
+                        // p100k: FP16 (input prepared on cs before the branch)
+                    } else if (q_il) strata::kernels::native_mmvq_il(wq->native_type, wq->native_data, xq_, xil_,
                                                                    qfull_ + tb * NH * 2 * HD, (int) N, (int) (NH * 2 * HD), n, ns);
                     else native_mmvq(wq->native_type, wq->native_data, xq_, qfull_ + tb * NH * 2 * HD, (int) N,
                                      (int) (NH * 2 * HD), n, ns);
@@ -2649,6 +2655,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         if (head_ != nullptr && head_->loaded()) {
             try {
                 float* const hl = head_logits_ + (size_t) h0 * (size_t) n_vocab_;
+                // p100k: the head (Q6_K, the whole vocabulary) in FP16 from the float input, when it takes the shape
+                if (p100_scr_ && HT >= 2 &&
+                    strata::kernels::p100_mmvq_f16_prep(head_mixed_ + (size_t) h0 * N, (int) N, (int) HT, p100_scr_, p100_scr_bytes_, cs) &&
+                    strata::kernels::p100_mmvq_f16(head_->type(), head_->weights(), hl, (int) N, (int) n_vocab_, (int) HT, p100_scr_, cs)) {
+                } else {
                 if (!q8_head) native_quantize_q8_1(head_mixed_ + (size_t) h0 * N, xq_, (int) N, HT, cs);   // (else the fused read wrote this chunk's image at xq_)
                 if (g_mmvq_il() && strata::kernels::native_mmvq_il_supported(head_->type(), (int) HT, (int) n_vocab_)) {
                     if (HT >= 2) strata::kernels::native_q8_1_interleave(xq_, xil_, (int) N, (int) HT, cs);
@@ -2656,6 +2667,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                                     (int) n_vocab_, (int) HT, cs);
                 } else
                 native_mmvq(head_->type(), head_->weights(), xq_, hl, (int) N, (int) n_vocab_, HT, cs);
+                }
             } catch (const std::exception& e) {
                 err = std::string("verify head: ") + e.what();
                 return false;
