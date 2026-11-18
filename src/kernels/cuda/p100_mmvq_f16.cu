@@ -734,6 +734,13 @@ static mmvq_f16_q5_K_cfg mmvq_f16_q5_K_pick(const int nc, const int64_t rows, co
     if (glu) { return { K5_G_RPW, K5_G_NWT, 0, K5_G_MINB }; }
     return { K5_F_RPW, K5_F_NWT, K5_F_KS, K5_F_MINB };
 #else
+    // p100k: STRATA_K5_CFG="rpw,nwt,ks,minb" (sweeps only): one of the compiled configurations (mmvq_f16_q5_K_run), not GLU
+    static const mmvq_f16_q5_K_cfg forced = [] {
+        mmvq_f16_q5_K_cfg c{0, 0, 0, 0};
+        if (const char* v = std::getenv("STRATA_K5_CFG")) std::sscanf(v, "%d,%d,%d,%d", &c.rpw, &c.nwt, &c.ks, &c.minb);
+        return c;
+    }();
+    if (forced.rpw > 0 && !glu) return forced;
     // from the k5s sweep (hx harness, us): the 2-warp tile spills past 8 columns (8704x5120 at 10:
     // 314 -> 239 with 4x1x8); small row counts want fewer rows per warp, and a K-split below 256 rows
     if (rows < 256) {
@@ -742,7 +749,9 @@ static mmvq_f16_q5_K_cfg mmvq_f16_q5_K_pick(const int nc, const int64_t rows, co
     if (rows < 1024) {
         return nc <= 5 ? mmvq_f16_q5_K_cfg{ 2, 2, 0, 8 } : mmvq_f16_q5_K_cfg{ 2, 1, 0, 16 };
     }
-    return nc <= 2 ? mmvq_f16_q5_K_cfg{ 4, 2, 0, 6 } : mmvq_f16_q5_K_cfg{ 4, 1, 0, 8 };
+    // p100k (Gyro-S shapes, 10240/6144/12288 x 2560 and 2560 x 6144, sweep 11-18): the 2-warp tile also wins at 3-5 columns
+    // (the verify windows), 5-20% (5 columns: 285 -> 254 us over the four); 6+ columns keep the 1-warp tile (spills above)
+    return nc <= 5 ? mmvq_f16_q5_K_cfg{ 4, 2, 0, 6 } : mmvq_f16_q5_K_cfg{ 4, 1, 0, 8 };
 #endif
 }
 
