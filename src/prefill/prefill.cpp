@@ -1394,6 +1394,17 @@ struct PeerPrefill {
     // APR (prism.hadamard): per layer, this device's copy of the down projection's sign vector (nullptr: identity or
     // not folded).  The gate/up input arrives already rotated (the primary sends its rotated copy, m.Xr).
     std::vector<const float*> had_sh;
+    // p100k (Tesla P100, an engine without MMQ): the peer computes its experts' rows with the grouped trellis kernels
+    // (p100_moe_tq_gemm, as the primary's resident experts) and sends one weighted FP16 sum per token back. It
+    // rotates its own gathered gate/up rows (had_sx), so a Hadamard-folded pack works too.
+    bool p100 = false;
+    std::vector<const float*> had_sx;
+    uint16_t* mixed_h = nullptr;   // the layer's FP16 activations on the peer (T_max x N)
+    uint16_t* Xs_g = nullptr;      // a group's gathered gate/up rows (G x N)
+    uint16_t* H16_g = nullptr;     // a group's SwiGLU output (G x n_ff)
+    strata::kernels::P100MoeJob* jobs = nullptr;        // on the peer
+    strata::kernels::P100MoeJob* host_jobs = nullptr;   // mapped, portable: written at enqueue, copied up on the peer's stream
+    size_t jobs_cap = 0;
     std::vector<void*> owned;
     int64_t layers = 0, experts = 0, rows = 0, over_cap = 0;   // stats
     ~PeerPrefill() {
@@ -1429,6 +1440,7 @@ struct PeerPrefill {
         if (host_x16) cudaFreeHost(host_x16);
         if (host_sum16) cudaFreeHost(host_sum16);
         if (host_adds) cudaFreeHost(host_adds);
+        if (host_jobs) cudaFreeHost(host_jobs);
     }
 };
 
@@ -3128,9 +3140,13 @@ namespace {
 void peer_had_signs(PeerPrefill& P) {
     const auto& lay = strata::kernels::cpu::expert_layout();
     P.had_sh.assign(lay.native ? lay.fmt.size() : 0, nullptr);
-    for (size_t l = 0; l < P.had_sh.size(); ++l)
+    P.had_sx.assign(P.had_sh.size(), nullptr);
+    for (size_t l = 0; l < P.had_sh.size(); ++l) {
         if (lay.fmt[l].had_d)
             P.had_sh[l] = strata::kernels::hadamard_device_signs(lay.fmt[l].d_signs, (int) lay.fmt[l].n_ff);
+        if (P.p100 && lay.fmt[l].had_gu)
+            P.had_sx[l] = strata::kernels::hadamard_device_signs(lay.fmt[l].gu_signs, (int) lay.fmt[l].n_embd);
+    }
 }
 }  // namespace
 
@@ -3250,24 +3266,39 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& e
     // (STRATA_PF_PEER_HOST=0: refuse as before, the prompt path then stays on the primary)
     const bool host_route_ok = [] { const char* v = std::getenv("STRATA_PF_PEER_HOST"); return v == nullptr || std::atoi(v) != 0; }();
     if (!peer->p2p() && !host_route_ok) { err = "prefill peer: the two GPUs cannot access each other (no P2P)"; return false; }
+    // p100k: every layer's experts in a trellis pair the P100 grouped kernels take (STRATA_PF_PEER_P100=0: as before)
+    const bool p100 = [&] {
+        const char* v = std::getenv("STRATA_PF_PEER_P100");
+        if ((v != nullptr && std::atoi(v) == 0) || !p100_moe_on()) return false;
+        const auto& lay = strata::kernels::cpu::expert_layout();
+        if (!lay.native || lay.fmt.empty()) return false;
+        for (const auto& f : lay.fmt)
+            if (f.tail_off || f.n_ff != kFF || f.n_embd != N || !strata::kernels::p100_moe_tq_supported(f.gu_type, (int) N, (int) kFF2) ||
+                !strata::kernels::p100_moe_tq_supported(f.d_type, (int) kFF, (int) N))
+                return false;
+        return true;
+    }();
 #if defined(STRATA_PF_OWN_ONLY)
-    err = "prefill peer: needs the MMQ prompt path (this engine was built without it)";
-    return false;
+    if (!p100) {
+        err = "prefill peer: needs the MMQ prompt path (this engine was built without it)";
+        return false;
+    }
 #endif
-    if (!mmq_plan().any) { err = "prefill peer: needs the MMQ prompt path"; return false; }
+    if (!p100 && !mmq_plan().any) { err = "prefill peer: needs the MMQ prompt path"; return false; }
     {   // NVFP4: the peer's MMQ products have no per-expert scales (grp_tail, row_sd); its decode rows do
         const auto& lay = strata::kernels::cpu::expert_layout();
         for (const auto& f : lay.fmt)
             if (lay.native && f.tail_off) { err = "prefill peer: not for NVFP4 experts yet"; return false; }
     }
-    if (strata::kernels::cpu::hadamard_spec().any()) {   // APR: the peer's MMQ share does not rotate; declined
+    if (!p100 && strata::kernels::cpu::hadamard_spec().any()) {   // APR: the peer's MMQ share does not rotate; declined
         std::fprintf(stderr, "strata: prefill peer: not used for a Hadamard-folded (APR) pack\n");
         m.pp.reset();
         return true;
     }
     auto pp = std::make_unique<PeerPrefill>();
     pp->peer = peer;
-    pp->p2p = peer->p2p();
+    pp->p100 = p100;
+    pp->p2p = p100 ? false : peer->p2p();   // p100k: the mapped host route (GPU-to-GPU copies are not used on these boxes)
     pp->T_max = m.T_max;
     pp->cap_rows = std::max<int64_t>(1, std::min<int64_t>(cap_rows, m.T_max * K));
     const int64_t R = pp->cap_rows;
@@ -3308,19 +3339,29 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& e
         const char* v = std::getenv("STRATA_PF_PEER_COMPACT");
         pp->compact = (v == nullptr || std::atoi(v) != 0) || !pp->p2p;   // the layer-sized path copies over P2P only
     }
+    if (pp->p100) pp->compact = true;
     if (pp->compact) {
         pp->cap_rows = m.T_max * K;   // no row cap: only the row tables grow with it
         pp->G = m.T_max;              // one expert never has more rows than the chunk has tokens
         const int64_t Gr = pp->G;
-        pp->Xq_g = take(mmq::q8_bytes(Gr, N));
-        pp->Hq_g = take(mmq::q8_bytes(Gr, kFF));
+        if (pp->p100) {
+            pp->mixed_h = (uint16_t*) take((size_t) m.T_max * N * 2);
+            pp->Xs_g = (uint16_t*) take((size_t) Gr * N * 2);
+            pp->H16_g = (uint16_t*) take((size_t) Gr * kFF * 2);
+            pp->jobs_cap = 2 * ((size_t) (m.T_max * K) / 16 + 2 * NE + 64);   // gate/up and down: <= rows / 16 + one per expert, each
+            pp->jobs = (strata::kernels::P100MoeJob*) take(pp->jobs_cap * sizeof(strata::kernels::P100MoeJob));
+        } else {
+            pp->Xq_g = take(mmq::q8_bytes(Gr, N));
+            pp->Hq_g = take(mmq::q8_bytes(Gr, kFF));
+            pp->H_g = (float*) take((size_t) Gr * kFF * 4);
+        }
         pp->GU_g = (float*) take((size_t) Gr * kFF2 * 4);
-        pp->H_g = (float*) take((size_t) Gr * kFF * 4);
         pp->Dm_b[0] = (float*) take((size_t) Gr * N * 4);
         pp->Dm_b[1] = (float*) take((size_t) Gr * N * 4);
         for (int b = 0; b < 2 && ok; ++b) ok = cudaEventCreateWithFlags(&pp->ev_dm[b], cudaEventDisableTiming) == cudaSuccess;
         const char* fs = std::getenv("STRATA_PF_PEER_STREAM");
         pp->ps_frac = fs ? std::atof(fs) : 0.35;   // measured: 0.25-0.5 all ~1950-1970 at 32K, 0.35 best
+        if (pp->p100) pp->ps_frac = 0.0;            // p100k: the peer computes what it holds only
         if (pp->ps_frac > 0.0 && !mp.fallback && m.T_max >= stream_all_min()) {
             pp->RP = 48;
             if (const char* pr = std::getenv("STRATA_PF_PEER_RING"); pr != nullptr) pp->RP = std::atoi(pr);
@@ -3347,14 +3388,14 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& e
     const int64_t Rt = pp->cap_rows;
     if (!pp->p2p && pp->compact) {
         const char* v = std::getenv("STRATA_PF_PEER_SUMS");
-        pp->sums = v == nullptr || std::atoi(v) != 0;
+        pp->sums = v == nullptr || std::atoi(v) != 0 || pp->p100;
     }
     if (pp->sums) {
         const char* v = std::getenv("STRATA_PF_PEER_F16");
-        pp->f16 = (v == nullptr || std::atoi(v) != 0) && N % 8 == 0;
+        pp->f16 = ((v == nullptr || std::atoi(v) != 0) && N % 8 == 0) || pp->p100;   // p100k: mixed_h comes over as FP16
         if (pp->f16) pp->sum16 = (uint16_t*) take((size_t) m.T_max * N * 2);
         const char* gv = std::getenv("STRATA_PF_PEER_GATHER");
-        pp->gather = gv == nullptr || std::atoi(gv) != 0;
+        pp->gather = gv == nullptr || std::atoi(gv) != 0 || pp->p100;
         if (pp->gather) {   // tokens and starts (<= 2 rows + 1 per group) and rows: <= 3 x the rows + 2 per expert
             pp->adds_cap = 3 * (size_t) Rt + 2 * NE + 64;
             pp->adds = (int32_t*) take(pp->adds_cap * 4);
@@ -3365,16 +3406,20 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& e
         pp->pair = (int32_t*) take((size_t) Rt * 4);
     }
     pp->src = (int32_t*) take((size_t) Rt * 4);
-    const uint64_t ident_rows = mmq::mmq_ids_table_rows((uint64_t) Rt, (uint64_t) m.T_max);   // + the stream-k fixup's over-read
-    if (ident_rows == 0) ok = false;
-    pp->ident = (int32_t*) take((size_t) ident_rows * 4);
     pp->bounds = (int32_t*) take((size_t) (2 * (NE + NE / MMQ_GROUP + 2)) * 4);
-    pp->grp_gu = (uint8_t*) take(MMQ_GROUP * mp.gu_max + MMQ_TAIL);
-    pp->grp_d = (uint8_t*) take(MMQ_GROUP * mp.d_max + MMQ_TAIL);
+    if (!pp->p100) {
+        const uint64_t ident_rows = mmq::mmq_ids_table_rows((uint64_t) Rt, (uint64_t) m.T_max);   // + the stream-k fixup's over-read
+        if (ident_rows == 0) ok = false;
+        pp->ident = (int32_t*) take((size_t) ident_rows * 4);
+        pp->grp_gu = (uint8_t*) take(MMQ_GROUP * mp.gu_max + MMQ_TAIL);
+        pp->grp_d = (uint8_t*) take(MMQ_GROUP * mp.d_max + MMQ_TAIL);
+        if (ok) {
+            pp->ctx = std::make_unique<mmq::Context>();
+            pp->run_ctx = pp->ctx.get();
+            mmq::iota(pp->ident, (int64_t) ident_rows, pp->s);
+        }
+    }
     if (ok) {
-        pp->ctx = std::make_unique<mmq::Context>();
-        pp->run_ctx = pp->ctx.get();
-        mmq::iota(pp->ident, (int64_t) ident_rows, pp->s);
         peer_had_signs(*pp);   // APR: on the peer's device
         ok = cudaStreamSynchronize(pp->s) == cudaSuccess;
     }
@@ -3404,6 +3449,8 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& e
         }
         if (ok) host(pp->host_src, pp->host_src_cap, (size_t) pp->cap_rows);
         if (ok) host(pp->host_bounds, bounds_cap, PeerPrefill::kHostBounds);
+        size_t jobs_hcap = 0;
+        if (ok && pp->p100) host(pp->host_jobs, jobs_hcap, pp->jobs_cap);
         if (!ok) {
             cudaSetDevice(prev);
             err = "prefill peer: the host route's pinned buffers (" +
@@ -5791,7 +5838,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         // multi-GPU: the rows of the experts the peer computes go last, as one block [peer_at, T*K)
                         std::vector<char> on_peer;
                         int64_t rows_local = T * K, rows_peer = 0;
-                        if (m.pp && pre_mmq) {
+                        if (m.pp && (pre_mmq || m.pp->p100)) {
                             on_peer.assign((size_t) m.g->n_expert, 0);
                             for (int32_t e = 0; e < m.g->n_expert; ++e) {
                                 const int32_t c = m.cnt[(size_t) e];
@@ -6235,13 +6282,15 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         } else if (i8_l) {
                             // (the int8 kernels read the tokens' q8_1 rows through src_dev: no per-row copy at all)
                         } else {
-                            gather_rows16(m.mixed_h, m.src_dev, m.Xs, T * K, N, m.cs);
+                            // (the peer's rows, the tail [peer_at, T*K), are gathered on the peer)
+                            const int64_t own = order_peer.empty() ? T * K : peer_at;
+                            gather_rows16(m.mixed_h, m.src_dev, m.Xs, own, N, m.cs);
                             // APR: Hadamard-folded gate/up take H (s * x); Xs is this layer's private gathered copy
                             // (rotated in fp16 storage, fp32 arithmetic: see the down projection's note below)
-                            if (had_gu) strata::kernels::hadamard_rows_f16(m.Xs, T * K, N, had_block, had_sx, m.cs);
+                            if (had_gu) strata::kernels::hadamard_rows_f16(m.Xs, own, N, had_block, had_sx, m.cs);
                         }
                         // multi-GPU: the peer's share, enqueued before the primary's own experts so both cards work at once
-                        peer_now = use_mmq && !order_peer.empty();
+                        peer_now = !order_peer.empty() && (use_mmq || m.pp->p100);
                         if (peer_now) {
                             PeerPrefill& P = *m.pp;
                             // the host route's copies beside the compute stream: the primary's own experts start at once
@@ -6268,6 +6317,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             if (P.out_pending) { cudaStreamWaitEvent(ps, P.ev_done, 0); P.out_pending = false; }
                             pe.mark(kPeMoeIn, ps);
                             if (P.p2p) cudaMemcpyPeerAsync(P.mixed, P.dev, m.mixed, prevd, (size_t) T * N * 4, ps);
+                            else if (P.p100) {   // the T token rows, rotated once here (the gathered rows are copies of them)
+                                cudaMemcpyAsync(P.mixed_h, P.host_x16, (size_t) T * N * 2, cudaMemcpyHostToDevice, ps);
+                                if (had_gu) strata::kernels::hadamard_rows_f16(P.mixed_h, T, N, had_block, P.had_sx[(size_t) l], ps);
+                            }
                             else if (P.f16) f16_to_f32_wide(P.mixed, P.host_x16, T * N, ps);
                             else copy_f32_wide(P.mixed, P.host_x, T * N, ps);
                             P.back_at = peer_at;
@@ -6300,7 +6353,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     int64_t gr = 0;
                                     for (size_t j = 0; j < n; ++j) {
                                         const int64_t c = m.cnt[(size_t) order_peer[j]];
-                                        if (j > g0 && (j - g0 == (size_t) MMQ_GROUP || gr + c > P.G)) { P.groups.push_back({g0, j}); g0 = j; gr = 0; }
+                                        if (j > g0 && ((j - g0 == (size_t) MMQ_GROUP && !P.p100) || gr + c > P.G)) { P.groups.push_back({g0, j}); g0 = j; gr = 0; }
                                         gr += c;
                                     }
                                     if (n > g0) P.groups.push_back({g0, n});
@@ -6361,9 +6414,65 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 }
                                 pe.mark(kPeMoeGemm, ps);
                                 const auto& f = lay.fmt[(size_t) l];
+                                size_t jat = 0;   // p100k: this layer's jobs in host_jobs / jobs, group after group
                                 for (size_t g2 = 0; g2 < ng; ++g2) {
                                     const size_t j0 = P.groups[g2].first, j1 = P.groups[g2].second;
                                     const int ngx = (int) (j1 - j0);
+                                    if (P.p100) {
+                                        // p100k: the group's rows gathered (and rotated) on this card, gate/up and down in one
+                                        // grouped launch each, then into the per-token sums as the MMQ share does
+                                        const int64_t r0 = P.bounds_host[j0], nr = P.bounds_host[j1] - r0;
+                                        if (nr <= 0) continue;
+                                        const int64_t avg = nr / std::max(1, ngx);
+                                        const int bn = avg >= 40 ? 64 : avg >= 12 ? 32 : 16;
+                                        size_t nj = 0;
+                                        for (size_t j = j0; j < j1; ++j) nj += (size_t) ((P.bounds_host[j + 1] - P.bounds_host[j] + bn - 1) / bn);
+                                        if (jat + 2 * nj > P.jobs_cap) {
+                                            err = "prefill: the P100 peer's job table overflows";
+                                            cudaSetDevice(prevd);
+                                            return false;
+                                        }
+                                        strata::kernels::P100MoeJob* hg = P.host_jobs + jat;
+                                        strata::kernels::P100MoeJob* hd = hg + nj;
+                                        size_t q = 0;
+                                        for (size_t j = j0; j < j1; ++j) {
+                                            const uint8_t* bd = P.peer->slot_ptr(l, order_peer[j]);
+                                            if (bd == nullptr) {
+                                                err = "prefill: an expert left the P100 peer during a prompt chunk";
+                                                cudaSetDevice(prevd);
+                                                return false;
+                                            }
+                                            const int32_t a0 = P.bounds_host[j] - (int32_t) r0, a1 = P.bounds_host[j + 1] - (int32_t) r0;
+                                            for (int32_t r = a0; r < a1; r += bn) {
+                                                const int np = std::min<int32_t>(bn, a1 - r);
+                                                hg[q] = {bd, bd + f.up_off, (int) r, np};
+                                                hd[q] = {bd + f.down_off, nullptr, (int) r, np};
+                                                ++q;
+                                            }
+                                        }
+                                        static_assert(sizeof(strata::kernels::P100MoeJob) % 4 == 0, "jobs go up as int32 words");
+                                        copy_i32(reinterpret_cast<int32_t*>(P.jobs + jat), reinterpret_cast<const int32_t*>(hg),
+                                                 (int64_t) (2 * nj * sizeof(strata::kernels::P100MoeJob) / 4), ps);
+                                        gather_rows16(P.mixed_h, P.src + r0, P.Xs_g, nr, N, ps);
+                                        bool ok = strata::kernels::p100_moe_tq_gemm(f.gu_type, P.jobs + jat, (int) nj, bn, P.Xs_g, (int) N,
+                                                                                    P.GU_g, kFF2, (int) kFF2, true, ps);
+                                        if (ok) {
+                                            swiglu_interleaved(P.GU_g, P.H16_g, nr, ps);
+                                            if (had_d) strata::kernels::hadamard_rows_f16(P.H16_g, nr, kFF, had_block, P.had_sh[(size_t) l], ps);
+                                            ok = strata::kernels::p100_moe_tq_gemm(f.d_type, P.jobs + jat + nj, (int) nj, bn, P.H16_g, (int) kFF,
+                                                                                   P.Dm_b[0], N, (int) N, false, ps);
+                                        }
+                                        if (!ok) {
+                                            err = "prefill: the P100 peer's grouped expert GEMM failed";
+                                            cudaSetDevice(prevd);
+                                            return false;
+                                        }
+                                        jat += 2 * nj;
+                                        const int32_t* a = P.adds + P.adds_at[g2];
+                                        const int64_t nt = P.ntok[g2];
+                                        peer_gather_add(P.sum, P.Dm_b[0], r0, P.wk, P.pair, a, a + nt, a + 2 * nt + 1, nt, ps);
+                                        continue;
+                                    }
                                     int64_t maxr = 0;
                                     for (size_t j = j0; j < j1; ++j) {
                                         const int32_t e = order_peer[j];
@@ -7047,8 +7156,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                         const int nj = (int) jg.size();
                                         bool ok = strata::kernels::p100_moe_tq_gemm(f.gu_type, jdev, nj, bn, m.Xs, (int) N, m.GU, kFF2, (int) kFF2, true, m.cs);
                                         if (ok) {
-                                            swiglu_interleaved(m.GU, m.Hh, T * K, m.cs);
-                                            if (had_d) strata::kernels::hadamard_rows_f16(m.Hh, T * K, kFF, had_block, had_sh, m.cs);
+                                            const int64_t own = order_peer.empty() ? T * K : peer_at;   // the peer's rows are its own
+                                            swiglu_interleaved(m.GU, m.Hh, own, m.cs);
+                                            if (had_d) strata::kernels::hadamard_rows_f16(m.Hh, own, kFF, had_block, had_sh, m.cs);
                                             ok = strata::kernels::p100_moe_tq_gemm(f.d_type, jdev + nj, nj, bn, m.Hh, (int) kFF, m.Dm, N, (int) N, false, m.cs);
                                         }
                                         if (ok) {
