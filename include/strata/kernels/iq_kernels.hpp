@@ -37,6 +37,14 @@ void iq_embed_rows(int ggml_type, const void* table, size_t row_bytes, const int
 /// uses: row 2r = gate row r, row 2r+1 = up row r.  `tail` (device, NVFP4 only): the blob's {s_gate, s_up,
 /// s_down, 0}; gate rows are scaled by s_gate and up rows by s_up (s_down goes on the down matrix: folded into up,
 /// the up weights would sit near 1e-8, deep in FP16's subnormals).
+// p100k (Tesla P100): grouped trellis expert GEMM for prompt processing (TQK6 145 / TQK7 146). A job is one expert's
+// tile of up to bn rows of the layer's expert-sorted FP16 activations: rows p0..p0+np-1 of X ([rows][K] half) give rows
+// p0.. of Y ([rows][ldy] float, columns 0..M-1). gate_up: w0 = gate, w1 = up, the M = 2 n_ff outputs interleaved
+// (column 2r gate row r, 2r + 1 up row r, as iq_dequant_gu_f16's rows); otherwise w0 = the down matrix (M rows).
+struct P100MoeJob { const void* w0; const void* w1; int p0; int np; };
+bool p100_moe_tq_supported(int ggml_type, int K, int M);
+bool p100_moe_tq_gemm(int ggml_type, const P100MoeJob* jobs_dev, int njobs, int bn, const void* X, int K, float* Y,
+                      int64_t ldy, int M, bool gate_up, void* stream);
 void iq_dequant_gu_f16(int ggml_type, const void* gate, const void* up, int64_t n_ff, int64_t n_embd, uint16_t* dst,
                        void* stream, const float* tail = nullptr);
 

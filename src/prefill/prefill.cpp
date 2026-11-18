@@ -285,6 +285,42 @@ bool ple_copy_stream_on() {
 }  // namespace
 namespace strata::prefill {
 namespace {
+// p100k: STRATA_P100_MOE (default on for compute capability 6.0; 0 off): grouped trellis expert GEMM in prompt chunks
+bool p100_moe_on() {
+#if defined(STRATA_USE_HIP) || defined(__HIPCC__)
+    return false;
+#else
+    static const bool on = [] {
+        const char* e = std::getenv("STRATA_P100_MOE");
+        if (e && e[0] == '0') return false;
+        int dev = 0, major = 0, minor = 0;
+        if (cudaGetDevice(&dev) != cudaSuccess) return false;
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
+        const bool v = major == 6 && minor == 0;
+        if (v) std::fprintf(stderr, "prefill: resident experts in grouped FP16 launches (Tesla P100; STRATA_P100_MOE=0 for the per-expert path)\n");
+        return v;
+    }();
+    return on;
+#endif
+}
+// a device buffer of at least n jobs on the current device (grown, never shrunk; prompt chunks run outside graph capture)
+strata::kernels::P100MoeJob* p100_moe_jobs(size_t n) {
+    static strata::kernels::P100MoeJob* buf[16] = {};
+    static size_t cap[16] = {};
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 16) return nullptr;
+    if (cap[dev] < n) {
+        if (buf[dev]) { cudaDeviceSynchronize(); cudaFree(buf[dev]); }
+        buf[dev] = nullptr; cap[dev] = 0;
+        const size_t want = std::max<size_t>(n, 4096);
+        if (cudaMalloc((void**) &buf[dev], want * sizeof(strata::kernels::P100MoeJob)) != cudaSuccess) { buf[dev] = nullptr; return nullptr; }
+        cap[dev] = want;
+    }
+    return buf[dev];
+}
+}  // namespace
+namespace {
 
 using Clock = std::chrono::steady_clock;
 constexpr float EPS = 1e-6f;
@@ -6681,7 +6717,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         // Few-row experts (fewrows.hpp): research switch STRATA_PF_FEWROWS, off unless set
                         static const bool fr_env = fewrows_switch(std::getenv("STRATA_PF_FEWROWS"), gp100_fp16_default(std::getenv("STRATA_PREFILL_MMQ")));
                         bool fr_q_done = false;   // the layer's rows quantized to q8_1 (once per layer)
+                        std::vector<char> pg_done;   // p100k: experts the grouped launches below already computed
                         auto compute = [&](size_t j, const uint8_t* blob_dev, int slot, int32_t cslot) -> bool {
+                            if (!pg_done.empty() && pg_done[j]) return true;
                             const int32_t e = order[j];
 #if STRATA_EXPERT_NIBBLE_BUILT
                             if (nib_l.on && (!use_mmq || direct || wmma_l || cslot < 0 || !lay.native ||
@@ -6970,6 +7008,60 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             m.gemm.f16(m.Hh + o0 * kFF, m.dq_d[q], m.Dm + o0 * N, ne, N, kFF);
                             return true;
                         };
+                        // p100k (Tesla P100): the layer's resident experts in one grouped launch per matrix (trellis pair on the FP16 path):
+                        // gate/up, SwiGLU and the down rotation over the rows, down. The per-expert chain launches ~8 kernels per routed
+                        // expert (launch-bound on the host). Streamed experts keep compute() below (their SwiGLU rewrites their rows first).
+                        if (!ws_layer && !use_mmq && p100_moe_on() && lay.native && m.Xs && m.Hh && m.GU && m.Dm && m.host_res && m.cache) {
+                            const auto& f = lay.fmt[(size_t) l];
+                            if (!f.tail_off && f.n_ff == kFF && f.n_embd == N &&
+                                strata::kernels::p100_moe_tq_supported(f.gu_type, (int) N, (int) kFF2) &&
+                                strata::kernels::p100_moe_tq_supported(f.d_type, (int) kFF, (int) N)) {
+                                int64_t rows = 0, nres = 0;
+                                for (size_t j = 0; j < order.size(); ++j) {
+                                    const int32_t e = order[j];
+                                    if (m.host_res[(size_t) l * m.g->n_expert + e] >= 0 && m.cnt[(size_t) e] > 0) { rows += m.cnt[(size_t) e]; ++nres; }
+                                }
+                                if (nres > 0) {
+                                    const int64_t avg = rows / nres;
+                                    const int bn = avg >= 40 ? 64 : avg >= 12 ? 32 : 16;
+                                    std::vector<strata::kernels::P100MoeJob> jg, jd;
+                                    std::vector<char> done(order.size(), 0);
+                                    for (size_t j = 0; j < order.size(); ++j) {
+                                        const int32_t e = order[j];
+                                        const int32_t cs_slot = m.host_res[(size_t) l * m.g->n_expert + e];
+                                        const int64_t o0 = m.off[(size_t) e], ne = m.cnt[(size_t) e];
+                                        if (cs_slot < 0 || ne <= 0) continue;
+                                        const uint8_t* blob = m.cache->device_slot(cs_slot);
+                                        for (int64_t r = 0; r < ne; r += bn) {
+                                            const int np = (int) std::min<int64_t>(bn, ne - r);
+                                            jg.push_back({blob, blob + f.up_off, (int) (o0 + r), np});
+                                            jd.push_back({blob + f.down_off, nullptr, (int) (o0 + r), np});
+                                        }
+                                        done[j] = 1;
+                                    }
+                                    strata::kernels::P100MoeJob* jdev = p100_moe_jobs(2 * jg.size());
+                                    if (jdev != nullptr) {
+                                        std::vector<strata::kernels::P100MoeJob> both(jg);
+                                        both.insert(both.end(), jd.begin(), jd.end());
+                                        cudaMemcpyAsync(jdev, both.data(), both.size() * sizeof(both[0]), cudaMemcpyHostToDevice, m.cs);
+                                        const int nj = (int) jg.size();
+                                        bool ok = strata::kernels::p100_moe_tq_gemm(f.gu_type, jdev, nj, bn, m.Xs, (int) N, m.GU, kFF2, (int) kFF2, true, m.cs);
+                                        if (ok) {
+                                            swiglu_interleaved(m.GU, m.Hh, T * K, m.cs);
+                                            if (had_d) strata::kernels::hadamard_rows_f16(m.Hh, T * K, kFF, had_block, had_sh, m.cs);
+                                            ok = strata::kernels::p100_moe_tq_gemm(f.d_type, jdev + nj, nj, bn, m.Hh, (int) kFF, m.Dm, N, (int) N, false, m.cs);
+                                        }
+                                        if (ok) {
+                                            pg_done.swap(done);
+                                            stats_.experts_resident += nres;
+                                        } else {
+                                            err = "prefill: the P100 grouped expert GEMM failed";
+                                            return false;
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         if (ws_layer) {
                             // STRATA_MMQ_WS: the layer's gate/up in one launch, H of all its rows in one pass, its down
                             // in one launch (no expert of the layer is staged or streamed: nothing to wait for or give

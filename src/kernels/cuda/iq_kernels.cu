@@ -6692,6 +6692,153 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     check("native_expert_grouped/down");
 }
 
+
+// ================== p100k: grouped trellis expert GEMM for prompt processing on the Tesla P100 ==================
+// One launch covers every (expert, tile of rows) job of a layer instead of a dequantize + GEMM chain per expert (the
+// per-expert chain launched ~8 kernels per routed expert: ~150k launches for a 1.5k-token read, launch-bound on the
+// host CPU). Design from p100k llama.cpp's p60-moe-gemm.cu (ours, MIT): per 64-wide K step a block decodes its weight
+// tile into shared memory as half2 k-pairs and multiplies with HFMA2; here the tile decoder reads the trellis types
+// (TQK6 / TQK7, 128 values per block) with tq_states4 / tq_step, the values dq_tq writes (d * codebook in float, then
+// half). The activations are FP16 rows already sorted by expert (the layer's Xs / Hh), so jobs need no gather.
+namespace {
+constexpr int PG_BK = 64, PG_KP = PG_BK / 2, PG_NTH = 256;
+
+template <int TY, int BN, int BMT, bool GU>
+__global__ void __launch_bounds__(PG_NTH, 2) p100_moe_tq_kernel(const P100MoeJob* __restrict__ jobs, int K,
+                                                                 const half2* __restrict__ X, float* __restrict__ Y,
+                                                                 int64_t ldy) {
+    using blk_t = typename TqInfo<TY>::block_t;
+    __shared__ __align__(16) half2 AP[PG_KP][BMT];
+    __shared__ __align__(16) half2 BP[PG_KP][BN];
+    const P100MoeJob jb = jobs[blockIdx.x];
+    if (jb.np <= 0) return;
+    const int m0 = blockIdx.y * BMT;
+    constexpr int PPT = BN / 16, RPT = BMT / 16;
+    constexpr int TPP = PG_NTH / BN, KPT = PG_KP / TPP;
+    const int tid = threadIdx.x, tx = tid & 15, ty = tid >> 4;
+    const int lr = tid >> 2, lp = tid & 3;
+    const int bpair = tid / TPP, bq = tid % TPP;
+    const int64_t row_blocks = K / 128;
+    float acc[RPT][PPT];
+#pragma unroll
+    for (int i = 0; i < RPT; i++)
+#pragma unroll
+        for (int j = 0; j < PPT; j++) acc[i][j] = 0.f;
+    for (int k0 = 0; k0 < K; k0 += PG_BK) {
+        const int kb = k0 / 128, lane = 4 * ((k0 % 128) / 64) + lp;
+#pragma unroll
+        for (int rr = 0; rr < BMT / 64; rr++) {
+            const int m = m0 + lr + 64 * rr;
+            const blk_t* rowp;
+            if constexpr (GU) {   // interleaved gate/up rows: 2r gate row r, 2r + 1 up row r
+                rowp = reinterpret_cast<const blk_t*>((m & 1) ? jb.w1 : jb.w0) + (int64_t) (m >> 1) * row_blocks;
+            } else {
+                rowp = reinterpret_cast<const blk_t*>(jb.w0) + (int64_t) m * row_blocks;
+            }
+            const blk_t* b = rowp + kb;
+            const float d = tq_h2f(STRATA_TQ_LD16(&b->d));
+            uint32_t s[4];
+            tq_states4<TY>(b->qs, lane, s);
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                float2 a, c;
+                tq_step(s[i], a, c);
+                AP[8 * lp + 2 * i][lr + 64 * rr] = __floats2half2_rn(d * a.x, d * a.y);
+                AP[8 * lp + 2 * i + 1][lr + 64 * rr] = __floats2half2_rn(d * c.x, d * c.y);
+            }
+        }
+        if (bpair < jb.np) {
+            const half2* src = X + (int64_t) (jb.p0 + bpair) * (K / 2) + k0 / 2 + KPT * bq;
+            half2 hv[KPT];
+            if constexpr (KPT % 4 == 0) {
+#pragma unroll
+                for (int e = 0; e < KPT; e += 4) *(uint4*) &hv[e] = *(const uint4*) (src + e);
+            } else {
+#pragma unroll
+                for (int e = 0; e < KPT; e += 2) *(uint2*) &hv[e] = *(const uint2*) (src + e);
+            }
+#pragma unroll
+            for (int e = 0; e < KPT; e++) BP[KPT * bq + e][bpair] = hv[e];
+        } else {
+#pragma unroll
+            for (int e = 0; e < KPT; e++) BP[KPT * bq + e][bpair] = __float2half2_rn(0.f);
+        }
+        __syncthreads();
+        half2 h[RPT][PPT];
+#pragma unroll
+        for (int i = 0; i < RPT; i++)
+#pragma unroll
+            for (int j = 0; j < PPT; j++) h[i][j] = __float2half2_rn(0.f);
+#pragma unroll 8
+        for (int kp = 0; kp < PG_KP; kp++) {
+            half2 ah[RPT];
+#pragma unroll
+            for (int i = 0; i < RPT; i += 4) *(uint4*) &ah[i] = *(const uint4*) &AP[kp][RPT * ty + i];
+            half2 bh[PPT];
+            if constexpr (PPT == 4) *(uint4*) bh = *(const uint4*) &BP[kp][4 * tx];
+            else if constexpr (PPT == 2) *(uint2*) bh = *(const uint2*) &BP[kp][2 * tx];
+            else bh[0] = BP[kp][tx];
+#pragma unroll
+            for (int i = 0; i < RPT; i++)
+#pragma unroll
+                for (int j = 0; j < PPT; j++) h[i][j] = __hfma2(ah[i], bh[j], h[i][j]);
+        }
+#pragma unroll
+        for (int i = 0; i < RPT; i++)
+#pragma unroll
+            for (int j = 0; j < PPT; j++) { const float2 f = __half22float2(h[i][j]); acc[i][j] += f.x + f.y; }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int j = 0; j < PPT; j++) {
+        const int pp = PPT * tx + j;
+        if (pp < jb.np) {
+            float* o = Y + (int64_t) (jb.p0 + pp) * ldy + m0 + RPT * ty;
+#pragma unroll
+            for (int i = 0; i < RPT; i += 4) *(float4*) (o + i) = make_float4(acc[i][j], acc[i + 1][j], acc[i + 2][j], acc[i + 3][j]);
+        }
+    }
+}
+
+template <int TY, bool GU>
+void p100_moe_tq_launch(const P100MoeJob* jobs, int njobs, int bn, const void* X, int K, float* Y, int64_t ldy, int M,
+                        cudaStream_t s) {
+    const int bmt = bn == 64 && M % 128 == 0 ? 128 : 64;
+    const dim3 grid((unsigned) njobs, (unsigned) (M / bmt));
+    const auto* xh = static_cast<const half2*>(X);
+    if (bn == 64 && bmt == 128) p100_moe_tq_kernel<TY, 64, 128, GU><<<grid, PG_NTH, 0, s>>>(jobs, K, xh, Y, ldy);
+    else if (bn == 64) p100_moe_tq_kernel<TY, 64, 64, GU><<<grid, PG_NTH, 0, s>>>(jobs, K, xh, Y, ldy);
+    else if (bn == 32) p100_moe_tq_kernel<TY, 32, 64, GU><<<grid, PG_NTH, 0, s>>>(jobs, K, xh, Y, ldy);
+    else p100_moe_tq_kernel<TY, 16, 64, GU><<<grid, PG_NTH, 0, s>>>(jobs, K, xh, Y, ldy);
+}
+}  // namespace
+
+bool p100_moe_tq_supported(int type, int K, int M) {
+#if defined(__HIPCC__)
+    return false;
+#else
+    return (type == 145 || type == 146) && K % 128 == 0 && M % 64 == 0 && K > 0 && M > 0;
+#endif
+}
+
+bool p100_moe_tq_gemm(int type, const P100MoeJob* jobs_dev, int njobs, int bn, const void* X, int K, float* Y,
+                      int64_t ldy, int M, bool gate_up, void* stream) {
+#if defined(__HIPCC__)
+    return false;
+#else
+    if (!p100_moe_tq_supported(type, K, M) || njobs <= 0 || (bn != 16 && bn != 32 && bn != 64)) return false;
+    const auto s = static_cast<cudaStream_t>(stream);
+    if (type == 145) {
+        if (gate_up) p100_moe_tq_launch<145, true>(jobs_dev, njobs, bn, X, K, Y, ldy, M, s);
+        else p100_moe_tq_launch<145, false>(jobs_dev, njobs, bn, X, K, Y, ldy, M, s);
+    } else {
+        if (gate_up) p100_moe_tq_launch<146, true>(jobs_dev, njobs, bn, X, K, Y, ldy, M, s);
+        else p100_moe_tq_launch<146, false>(jobs_dev, njobs, bn, X, K, Y, ldy, M, s);
+    }
+    return cudaPeekAtLastError() == cudaSuccess;
+#endif
+}
+
 }  // namespace strata::kernels
 
 // ---------------------------------------------------------------- STRATA_EXPERT_NIBBLE: expert_nibble.hpp's functions
