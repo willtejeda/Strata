@@ -318,7 +318,17 @@ bool PeerExperts::launch(int64_t layer, const float* x, const int32_t* ids, int6
     }
     if (direct) {   // the rows straight into the host `out` (zero-copy, coalesced float4 writes)
         try {
-            strata::kernels::scatter_rows_f32(d_out_, out, dm->out_row, rows, H, s);
+            // p100k STRATA_PEER_F16=1: FP16 rows with an end marker (half the bytes over this card's link); the verifier's
+            // row copy (copy_rows_from_mapped, the STRATA_DEC_BATCH path) reads them. Off when that path is off.
+            static const bool f16 = [] {
+                const char* v = std::getenv("STRATA_PEER_F16");
+                const char* db = std::getenv("STRATA_DEC_BATCH");
+                const bool on = v != nullptr && std::atoi(v) != 0 && !(db != nullptr && std::atoi(db) == 0);
+                if (on) std::fprintf(stderr, "strata: peer GPU rows go back as FP16 (STRATA_PEER_F16)\n");
+                return on;
+            }();
+            if (f16) strata::kernels::scatter_rows_f16m(d_out_, out, dm->out_row, rows, H, s);
+            else strata::kernels::scatter_rows_f32(d_out_, out, dm->out_row, rows, H, s);
         } catch (const std::exception& e) { err = std::string("peer experts: scatter: ") + e.what(); return false; }
         launched_direct_ = true;
         return true;

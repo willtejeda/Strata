@@ -106,6 +106,10 @@ void copy_from_mapped(float* dst, const float* src, int64_t n, void* stream);
 /// which are written +0.0 instead (a verify window's GPU-computed entries: the pool leaves zeros there).
 /// multi-GPU: dst[rows[r] * width ..] = src[r * width ..] for r < n (float4; dst may be mapped host memory).
 void scatter_rows_f32(const float* src, float* dst, const int32_t* rows, int64_t n, int64_t width, void* stream);
+/// p100k (STRATA_PEER_F16): as scatter_rows_f32, but each row as FP16 in the first half of its float slot plus two marker
+/// words (NaN payloads no arithmetic produces) in the slot's last 8 bytes; copy_rows_from_mapped reads a marked row as FP16.
+constexpr uint32_t kPeerF16MarkA = 0x7FC0F16Au, kPeerF16MarkB = 0x7FC0F16Bu;
+void scatter_rows_f16m(const float* src, float* dst, const int32_t* rows, int64_t n, int64_t width, void* stream);
 void copy_rows_from_mapped(float* dst, const float* src, int64_t rows, int64_t width, const int32_t* hit_rows,
                            const int32_t* count, void* stream);
 /// copy_rows_from_mapped after spinning on *flag >= value (every block's thread 0 polls the mapped flag; the

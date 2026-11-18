@@ -6,6 +6,7 @@
 #include "strata/kernels/f16_bits.hpp"
 
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 
 #include <cmath>
 #include <cstdio>
@@ -248,12 +249,24 @@ __global__ void copy_rows_from_mapped_kernel(float4* __restrict__ dst, const vol
         int h = 0;
         const int c = *count;
         for (int i = 0; i < c; ++i) h |= hit_rows[i] == row;
+        if (!h) {   // p100k: a peer row written as FP16 (scatter_rows_f16m) carries the two marker words at its end
+            const volatile uint32_t* tail = reinterpret_cast<const volatile uint32_t*>(src + (int64_t) row * row4 + row4) - 2;
+            if (tail[0] == kPeerF16MarkA && tail[1] == kPeerF16MarkB) h = 2;
+        }
         hit = h;
     }
     __syncthreads();
     float4* d = dst + (int64_t) row * row4;
-    if (hit) {
+    if (hit == 1) {
         for (int64_t i = threadIdx.x; i < row4; i += blockDim.x) d[i] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    } else if (hit == 2) {   // FP16: 4 halves (8 bytes) per output float4, in the first half of the row's slot
+        const volatile uint2* sr = reinterpret_cast<const volatile uint2*>(src + (int64_t) row * row4);
+        for (int64_t i = threadIdx.x; i < row4; i += blockDim.x) {
+            const uint2 v = const_cast<const uint2*>(sr)[i];
+            const float2 a = __half22float2(*reinterpret_cast<const __half2*>(&v.x));
+            const float2 b = __half22float2(*reinterpret_cast<const __half2*>(&v.y));
+            d[i] = make_float4(a.x, a.y, b.x, b.y);
+        }
     } else {
         const volatile float4* sr = src + (int64_t) row * row4;
         for (int64_t i = threadIdx.x; i < row4; i += blockDim.x) d[i] = const_cast<const float4*>(sr)[i];
@@ -268,6 +281,34 @@ __global__ void scatter_rows_kernel(const float4* __restrict__ src, float4* dst,
     for (int64_t i = threadIdx.x; i < w4; i += blockDim.x) d[i] = s[i];
 }
 }  // namespace
+// p100k: the peer's rows as FP16 in the first half of each float row slot of the mapped buffer, then the two marker words
+// in the slot's last 8 bytes (copy_rows_from_mapped_kernel reads such a row as FP16). Half the bytes over the peer's link.
+__global__ void scatter_rows_f16m_kernel(const float4* __restrict__ src, float* dst, const int32_t* __restrict__ rows,
+                                         int64_t w4) {
+    const int64_t r = blockIdx.x;
+    const float4* s = src + r * w4;
+    float* drow = dst + (int64_t) rows[r] * w4 * 4;
+    uint2* d = reinterpret_cast<uint2*>(drow);
+    for (int64_t i = threadIdx.x; i < w4; i += blockDim.x) {
+        const float4 v = s[i];
+        const __half2 a = __floats2half2_rn(v.x, v.y), b = __floats2half2_rn(v.z, v.w);
+        d[i] = make_uint2(*reinterpret_cast<const uint32_t*>(&a), *reinterpret_cast<const uint32_t*>(&b));
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        uint32_t* tail = reinterpret_cast<uint32_t*>(drow + w4 * 4) - 2;
+        tail[0] = kPeerF16MarkA;
+        tail[1] = kPeerF16MarkB;
+    }
+}
+void scatter_rows_f16m(const float* src, float* dst, const int32_t* rows, int64_t n, int64_t width, void* stream) {
+    if (n <= 0) return;
+    if ((width & 3) != 0 || width < 16 || ((uintptr_t) dst & 15) != 0 || ((uintptr_t) src & 15) != 0) {
+        std::fprintf(stderr, "scatter_rows_f16m: width must be a multiple of 4 (>= 16) and both pointers 16-byte aligned\n");
+        std::exit(1);
+    }
+    scatter_rows_f16m_kernel<<<(unsigned) n, 128, 0, (cudaStream_t) stream>>>((const float4*) src, dst, rows, width / 4);
+}
 void scatter_rows_f32(const float* src, float* dst, const int32_t* rows, int64_t n, int64_t width, void* stream) {
     if (n <= 0) return;
     if ((width & 3) != 0 || ((uintptr_t) dst & 15) != 0 || ((uintptr_t) src & 15) != 0) {
