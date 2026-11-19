@@ -2042,37 +2042,6 @@ __global__ void __launch_bounds__(THREADS) gr_down_q8_kernel(GrMulti m, float* _
         }
     }
     float ssp[T];
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 700
-    // p100k (cc 6.0): every token's loads issued before any is used (the per-token loop paid T DRAM round trips in
-    // sequence: ~5 us a token at T 3-5), the norm weights loaded once; the same operations in the same order (bitwise)
-    float gwv[T];
-#pragma unroll
-    for (int k = 0; k < T; ++k) {
-        ssp[k] = 0.0f;
-        gwv[k] = m.a[k].apply ? 2.0f * sigmoidf_(m.a[k].inj_prev[c] / (float) HC) : 0.0f;
-    }
-    for (int i = t; i < Q8_KC / 4; i += THREADS) {
-        const int col = kc * Q8_KC + 4 * i;
-        float4 r[T], b[T];
-#pragma unroll
-        for (int k = 0; k < T; ++k) {
-            r[k] = *reinterpret_cast<const float4*>(m.a[k].R + col);
-            b[k] = m.a[k].apply ? *reinterpret_cast<const float4*>(m.a[k].bo_prev + (col - c * N)) : make_float4(0.f, 0.f, 0.f, 0.f);
-        }
-        const float4 g = *reinterpret_cast<const float4*>(m.a[0].w_norm + col);
-#pragma unroll
-        for (int k = 0; k < T; ++k) {
-            float4 rr = r[k];
-            if (m.a[k].apply) {
-                const float gw = gwv[k];
-                rr.x = fmaf(b[k].x, gw, rr.x); rr.y = fmaf(b[k].y, gw, rr.y);
-                rr.z = fmaf(b[k].z, gw, rr.z); rr.w = fmaf(b[k].w, gw, rr.w);
-            }
-            ssp[k] += rr.x * rr.x + rr.y * rr.y + rr.z * rr.z + rr.w * rr.w;
-            *reinterpret_cast<float4*>(&xs[k][4 * i]) = make_float4(rr.x * g.x, rr.y * g.y, rr.z * g.z, rr.w * g.w);
-        }
-    }
-#else
 #pragma unroll
     for (int k = 0; k < T; ++k) {
         ssp[k] = 0.0f;
@@ -2091,7 +2060,6 @@ __global__ void __launch_bounds__(THREADS) gr_down_q8_kernel(GrMulti m, float* _
             *reinterpret_cast<float4*>(&xs[k][4 * i]) = make_float4(r.x * g.x, r.y * g.y, r.z * g.z, r.w * g.w);
         }
     }
-#endif
 #pragma unroll
     for (int k = 0; k < T; ++k) {
         const float v = warp_sum(ssp[k]);
