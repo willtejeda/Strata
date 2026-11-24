@@ -49,6 +49,14 @@
 #include <string>
 #include <vector>
 
+// Strata's own expert types (TQ1/TQ2 blobs, ids past GGML_TYPE_COUNT) have no ggml name: print the id instead of
+// passing a null to printf (crashed the Gyro-S load check, 2026-11-24).
+static std::string type_label(int t) {
+    const char * n = (t >= 0 && t < GGML_TYPE_COUNT) ? ggml_type_name((ggml_type) t) : nullptr;
+    return n ? std::string(n) : "type " + std::to_string(t);
+}
+
+
 namespace cpu = strata::kernels::cpu;
 
 static double rel(const std::vector<float>& a, const std::vector<float>& b) {
@@ -859,8 +867,8 @@ int check_load(const char* pack, const char* gguf) {
                  std::to_string(f.d_type));
     }
     std::printf("  experts: native_experts.txt v%d, %zu layers (%s/%s ...), %.2f GiB; hadamard block %d, %d layers folded\n",
-                lay.version, lay.fmt.size(), ggml_type_name((ggml_type) lay.fmt[0].gu_type),
-                ggml_type_name((ggml_type) lay.fmt[0].d_type), lay.total / 1073741824.0, hs.block, folded);
+                lay.version, lay.fmt.size(), type_label(lay.fmt[0].gu_type).c_str(),
+                type_label(lay.fmt[0].d_type).c_str(), lay.total / 1073741824.0, hs.block, folded);
     if (!strata::core::check_experts_gguf(gguf, lay, err)) fail("check_experts_gguf: " + err);
     else std::printf("  check_experts_gguf: ok\n");
     const std::vector<std::string> shards = strata::gguf_split_paths(gguf);
